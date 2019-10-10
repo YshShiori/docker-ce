@@ -245,9 +245,12 @@ func (a *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 		return fmt.Errorf("--storage-opt is not supported for aufs")
 	}
 
+	// 创建<root>/diff/[id], <root>/mnt/[id]对应的目录
 	if err := a.createDirsFor(id); err != nil {
 		return err
 	}
+
+	// 创建<root>/layers/id文件
 	// Write the layers metadata
 	f, err := os.Create(path.Join(a.rootPath(), "layers", id))
 	if err != nil {
@@ -255,6 +258,7 @@ func (a *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 	}
 	defer f.Close()
 
+	// 在文件中写入其[id]对应的所有的祖先layer的id
 	if parent != "" {
 		ids, err := getParentIDs(a.rootPath(), parent)
 		if err != nil {
@@ -389,19 +393,24 @@ func atomicRemove(source string) error {
 
 // Get returns the rootfs path for the id.
 // This will mount the dir at its given path
+// 对于image的ro layer, 应该都不会调用这个接口, 因为所有的mnt的目录都没有挂载
 func (a *Driver) Get(id, mountLabel string) (containerfs.ContainerFS, error) {
 	a.locker.Lock(id)
 	defer a.locker.Unlock(id)
+
+	// 取得id对应的祖先layer的各个diff目录下对应的path
 	parents, err := a.getParentLayerPaths(id)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
 
+	// 取得mountpoint
 	a.pathCacheLock.Lock()
 	m, exists := a.pathCache[id]
 	a.pathCacheLock.Unlock()
 
 	if !exists {
+		// 这里可以看到, 对应于最低层的layer, mountpoint为diff对应目录(因为最底层就是一个root fs)
 		m = a.getDiffPath(id)
 		if len(parents) > 0 {
 			m = a.getMountpoint(id)
@@ -411,6 +420,7 @@ func (a *Driver) Get(id, mountLabel string) (containerfs.ContainerFS, error) {
 		return containerfs.NewLocalContainerFS(m), nil
 	}
 
+	// 进行挂载！
 	// If a dir does not have a parent ( no layers )do not try to mount
 	// just return the diff path to the data
 	if len(parents) > 0 {
@@ -419,6 +429,7 @@ func (a *Driver) Get(id, mountLabel string) (containerfs.ContainerFS, error) {
 		}
 	}
 
+	// 更新cache
 	a.pathCacheLock.Lock()
 	a.pathCache[id] = m
 	a.pathCacheLock.Unlock()
@@ -430,16 +441,21 @@ func (a *Driver) Put(id string) error {
 	a.locker.Lock(id)
 	defer a.locker.Unlock(id)
 	a.pathCacheLock.Lock()
+
+	// 确认mountpoint(读取缓存或者直接路径拼接)
 	m, exists := a.pathCache[id]
 	if !exists {
 		m = a.getMountpoint(id)
 		a.pathCache[id] = m
 	}
 	a.pathCacheLock.Unlock()
+
+	// 检查引用计数, 只有count为0时才能进行umount
 	if count := a.ctr.Decrement(m); count > 0 {
 		return nil
 	}
 
+	// 执行unmount
 	err := a.unmount(m)
 	if err != nil {
 		logrus.Debugf("Failed to unmount %s aufs: %v", id, err)
@@ -555,13 +571,20 @@ func (a *Driver) mount(id string, target string, mountLabel string, layers []str
 	a.Lock()
 	defer a.Unlock()
 
+	// 确认target是否已经mount
 	// If the id is mounted or we get an error return
 	if mounted, err := a.mounted(target); err != nil || mounted {
 		return err
 	}
 
+	// 得到id对应的layer目录, 即<root>/diff/id目录
 	rw := a.getDiffPath(id)
 
+	// 真正进行aufs的mount操作
+	//	各参数为:
+	//		layers: 其layer的祖先layer的diff对应目录的path, 有序
+	//		rw: 需要挂载的layer的diff对应目录path
+	//		target: layer对应的mount目录, 即<root>/mnt/id目录
 	if err := a.aufsMount(layers, rw, target, mountLabel); err != nil {
 		return fmt.Errorf("error creating aufs mount to %s: %v", target, err)
 	}
@@ -585,6 +608,8 @@ func (a *Driver) mounted(mountpoint string) (bool, error) {
 // Cleanup aufs and unmount all mountpoints
 func (a *Driver) Cleanup() error {
 	var dirs []string
+
+	// 遍历所有<root>/mnt下目录, 记录其路径
 	if err := filepath.Walk(a.mntPath(), func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -598,16 +623,20 @@ func (a *Driver) Cleanup() error {
 		return err
 	}
 
+	// 对所有存在mnt目录的进行umount操作
 	for _, m := range dirs {
 		if err := a.unmount(m); err != nil {
 			logrus.Debugf("aufs error unmounting %s: %s", m, err)
 		}
 	}
+
+	// umount root目录
 	return mountpk.RecursiveUnmount(a.root)
 }
 
 func (a *Driver) aufsMount(ro []string, rw, target, mountLabel string) (err error) {
 	defer func() {
+		// 出现错误时, 进行一个Umount
 		if err != nil {
 			Unmount(target)
 		}

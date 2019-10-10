@@ -646,19 +646,24 @@ func (ls *layerStore) initMount(graphID, parent, mountLabel string, initFunc Mou
 		StorageOpt: storageOpt,
 	}
 
+	// 创建init layer
 	if err := ls.driver.CreateReadWrite(initID, parent, createOpts); err != nil {
 		return "", err
 	}
+	// 进行init layer的挂载
 	p, err := ls.driver.Get(initID, "")
 	if err != nil {
 		return "", err
 	}
 
+	// 执行initFunc
 	if err := initFunc(p); err != nil {
 		ls.driver.Put(initID)
 		return "", err
 	}
 
+	// 执行结束取消了init layer的挂载
+	// 所以正常情况下init的挂载只是用于进行初始化使用, 不会存在于mount中
 	if err := ls.driver.Put(initID); err != nil {
 		return "", err
 	}

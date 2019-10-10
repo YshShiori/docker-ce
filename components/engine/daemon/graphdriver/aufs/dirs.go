@@ -47,6 +47,9 @@ func getParentIDs(root, id string) ([]string, error) {
 	return out, s.Err()
 }
 
+/////////////////////////////////////////////////////////////
+// 下面各个函数定义了取得id对应的layers、mnt、diff下目录/文件的方式
+
 func (a *Driver) getMountpoint(id string) string {
 	return path.Join(a.mntPath(), id)
 }
