@@ -13,7 +13,7 @@ import (
 	"github.com/docker/distribution"
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/image"
-	"github.com/docker/docker/image/v1"
+	v1 "github.com/docker/docker/image/v1"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/system"
@@ -37,6 +37,7 @@ type saveSession struct {
 }
 
 func (l *tarexporter) Save(names []string, outStream io.Writer) error {
+	// 解析所有需要save的image的name, 得到每个image的imageDescriptor
 	images, err := l.parseNames(names)
 	if err != nil {
 		return err
@@ -180,10 +181,12 @@ func (l *tarexporter) releaseLayerReferences(imgDescr map[image.ID]*imageDescrip
 	return nil
 }
 
+// save 执行多个image的save操作
 func (s *saveSession) save(outStream io.Writer) error {
 	s.savedLayers = make(map[string]struct{})
 	s.diffIDPaths = make(map[layer.DiffID]string)
 
+	// 创建tmp目录， 路径为"docker-export-xxxx"
 	// get image json
 	tempDir, err := ioutil.TempDir("", "docker-export-")
 	if err != nil {
@@ -197,7 +200,9 @@ func (s *saveSession) save(outStream io.Writer) error {
 	var manifest []manifestItem
 	var parentLinks []parentLink
 
+	// 遍历所有需要save的img
 	for id, imageDescr := range s.images {
+		// save image对应所有layer内容与img的config文件
 		foreignSrcs, err := s.saveImage(id)
 		if err != nil {
 			return err
@@ -206,6 +211,7 @@ func (s *saveSession) save(outStream io.Writer) error {
 		var repoTags []string
 		var layers []string
 
+		// 记录image与所有的layer信息至manifest
 		for _, ref := range imageDescr.refs {
 			familiarName := reference.FamiliarName(ref)
 			if _, ok := reposLegacy[familiarName]; !ok {
@@ -215,6 +221,7 @@ func (s *saveSession) save(outStream io.Writer) error {
 			repoTags = append(repoTags, reference.FamiliarString(ref))
 		}
 
+		// 一个manifest的信息
 		for _, l := range imageDescr.layers {
 			layers = append(layers, filepath.Join(l, legacyLayerFileName))
 		}
@@ -256,6 +263,7 @@ func (s *saveSession) save(outStream io.Writer) error {
 		}
 	}
 
+	// 将所有image的manifest信息保存到"manifest.json"文件中
 	manifestFileName := filepath.Join(tempDir, manifestFileName)
 	f, err := os.OpenFile(manifestFileName, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
@@ -269,6 +277,7 @@ func (s *saveSession) save(outStream io.Writer) error {
 
 	f.Close()
 
+	// 打包整个tmp目录为一个tar包
 	if err := system.Chtimes(manifestFileName, time.Unix(0, 0), time.Unix(0, 0)); err != nil {
 		return err
 	}
@@ -279,10 +288,12 @@ func (s *saveSession) save(outStream io.Writer) error {
 	}
 	defer fs.Close()
 
+	// 通过outStream输出tar包数据
 	_, err = io.Copy(outStream, fs)
 	return err
 }
 
+// saveImage 保存image config与 layer内容
 func (s *saveSession) saveImage(id image.ID) (map[layer.DiffID]distribution.Descriptor, error) {
 	img := s.images[id].image
 	if len(img.RootFS.DiffIDs) == 0 {
@@ -292,7 +303,9 @@ func (s *saveSession) saveImage(id image.ID) (map[layer.DiffID]distribution.Desc
 	var parent digest.Digest
 	var layers []string
 	var foreignSrcs map[layer.DiffID]distribution.Descriptor
+	// 遍历image的所有layer, save layer信息与内容至目录中
 	for i := range img.RootFS.DiffIDs {
+		// 得到image对应的V1Image信息
 		v1Img := image.V1Image{
 			// This is for backward compatibility used for
 			// pre v1.9 docker.
@@ -313,6 +326,7 @@ func (s *saveSession) saveImage(id image.ID) (map[layer.DiffID]distribution.Desc
 			v1Img.Parent = parent.Hex()
 		}
 
+		// save layer内容与v1Image信息至目录
 		src, err := s.saveLayer(rootFS.ChainID(), v1Img, img.Created)
 		if err != nil {
 			return nil, err
@@ -327,6 +341,7 @@ func (s *saveSession) saveImage(id image.ID) (map[layer.DiffID]distribution.Desc
 		}
 	}
 
+	// save image config文件
 	configFile := filepath.Join(s.outDir, id.Digest().Hex()+".json")
 	if err := ioutil.WriteFile(configFile, img.RawJSON(), 0644); err != nil {
 		return nil, err

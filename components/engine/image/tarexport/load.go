@@ -14,7 +14,7 @@ import (
 	"github.com/docker/distribution"
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/image"
-	"github.com/docker/docker/image/v1"
+	v1 "github.com/docker/docker/image/v1"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/chrootarchive"
@@ -27,6 +27,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// Load 为docker load执行的逻辑, 将一个tar包加载为image
 func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool) error {
 	var progressOutput progress.Output
 	if !quiet {
@@ -34,15 +35,18 @@ func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool)
 	}
 	outStream = streamformatter.NewStdoutWriter(outStream)
 
+	// 创建tmp目录: "docker-import-xxxx"
 	tmpDir, err := ioutil.TempDir("", "docker-import-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
 
+	// 解析tar包, 输出到tmp目录
 	if err := chrootarchive.Untar(inTar, tmpDir, nil); err != nil {
 		return err
 	}
+	// 读取解压后的"manifest.json"
 	// read manifest, if no file then load in legacy mode
 	manifestPath, err := safePath(tmpDir, manifestFileName)
 	if err != nil {
@@ -50,6 +54,7 @@ func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool)
 	}
 	manifestFile, err := os.Open(manifestPath)
 	if err != nil {
+		// 如果manifest不存在, 尝试接着上一次load?
 		if os.IsNotExist(err) {
 			return l.legacyLoad(tmpDir, outStream, progressOutput)
 		}
@@ -57,6 +62,7 @@ func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool)
 	}
 	defer manifestFile.Close()
 
+	// 读取manifest文件内容, 每个item表示一个image, 多个之间表示为parent关系
 	var manifest []manifestItem
 	if err := json.NewDecoder(manifestFile).Decode(&manifest); err != nil {
 		return err
@@ -66,7 +72,9 @@ func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool)
 	var imageIDsStr string
 	var imageRefCount int
 
+	// 遍历每个manifest信息
 	for _, m := range manifest {
+		// 读取对应img的config文件信息, 文件名为"[imgid].json"
 		configPath, err := safePath(tmpDir, m.Config)
 		if err != nil {
 			return err
@@ -79,6 +87,7 @@ func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool)
 		if err != nil {
 			return err
 		}
+		// 检查img能否运行
 		if err := checkCompatibleOS(img.OS); err != nil {
 			return err
 		}
@@ -100,7 +109,9 @@ func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool)
 			}
 		}
 
+		// 读取img config中每个layer, 从底层向上加载layer
 		for i, diffID := range img.RootFS.DiffIDs {
+			// 得到layer的对应目录
 			layerPath, err := safePath(tmpDir, m.Layers[i])
 			if err != nil {
 				return err
@@ -109,6 +120,7 @@ func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool)
 			r.Append(diffID)
 			newLayer, err := l.lss[os].Get(r.ChainID())
 			if err != nil {
+				// layer还不存在<lss>, 那么load layer
 				newLayer, err = l.loadLayer(layerPath, rootFS, diffID.String(), os, m.LayerSources[diffID], progressOutput)
 				if err != nil {
 					return err
@@ -121,12 +133,14 @@ func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool)
 			rootFS.Append(diffID)
 		}
 
+		// image对应所有layer加载完, 在<is>创建对应的img
 		imgID, err := l.is.Create(config)
 		if err != nil {
 			return err
 		}
 		imageIDsStr += fmt.Sprintf("Loaded image ID: %s\n", imgID)
 
+		// 在<rs>记录对应的tag, 并输出结果
 		imageRefCount = 0
 		for _, repoTag := range m.RepoTags {
 			named, err := reference.ParseNormalizedNamed(repoTag)
@@ -137,15 +151,18 @@ func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool)
 			if !ok {
 				return fmt.Errorf("invalid tag %q", repoTag)
 			}
+			// 在<rs>记录img对应tag
 			l.setLoadedTag(ref, imgID.Digest(), outStream)
 			outStream.Write([]byte(fmt.Sprintf("Loaded image: %s\n", reference.FamiliarString(ref))))
 			imageRefCount++
 		}
 
+		// 记录多个img之间的parent关系
 		parentLinks = append(parentLinks, parentLink{imgID, m.Parent})
 		l.loggerImgEvent.LogImageEvent(imgID.String(), imgID.String(), "load")
 	}
 
+	// 将各个img之间的parent关系记录到<is>对应的Image结构中
 	for _, p := range validatedParentLinks(parentLinks) {
 		if p.parentID != "" {
 			if err := l.setParentID(p.id, p.parentID); err != nil {
