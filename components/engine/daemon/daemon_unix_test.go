@@ -14,7 +14,7 @@ import (
 	"github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/volume"
-	"github.com/docker/docker/volume/drivers"
+	volumedrivers "github.com/docker/docker/volume/drivers"
 	"github.com/docker/docker/volume/local"
 	"github.com/docker/docker/volume/store"
 	"github.com/gotestyourself/gotestyourself/assert"

@@ -31,6 +31,7 @@ require (
 	github.com/coreos/go-semver v0.2.0
 	github.com/coreos/go-systemd v0.0.0-20190321100706-95778dfbb74e
 	github.com/coreos/pkg v0.0.0-20180928190104-399ea9e2e55f
+	github.com/cyphar/filepath-securejoin v0.2.2 // indirect
 	github.com/deckarep/golang-set v0.0.0-20141123011944-ef32fa3046d9
 	github.com/dmcgowan/go-tar v0.0.0-20171110022031-01eea4a853c4
 	github.com/docker/distribution v2.6.0-rc.1.0.20170726174610-edc3ab29cdff+incompatible
@@ -77,6 +78,7 @@ require (
 	github.com/miekg/dns v0.0.0-20151202105714-75e6e86cc601
 	github.com/mistifyio/go-zfs v2.1.2-0.20160425201758-22c9b32c84eb+incompatible
 	github.com/moby/buildkit v0.0.0-20170922161955-aaff9d591ef1
+	github.com/mrunalp/fileutils v0.0.0-20171103030105-7d4729fb3618 // indirect
 	github.com/opencontainers/go-digest v1.0.0-rc1
 	github.com/opencontainers/image-spec v1.0.1
 	github.com/opencontainers/runc v1.0.0-rc5

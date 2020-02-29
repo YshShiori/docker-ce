@@ -32,6 +32,7 @@ import (
 	"github.com/docker/docker/daemon/network"
 	"github.com/docker/docker/errdefs"
 	"github.com/sirupsen/logrus"
+
 	// register graph drivers
 	_ "github.com/docker/docker/daemon/graphdriver/register"
 	"github.com/docker/docker/daemon/stats"
@@ -40,7 +41,7 @@ import (
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/libcontainerd"
-	"github.com/docker/docker/migrate/v1"
+	v1 "github.com/docker/docker/migrate/v1"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/locker"
 	"github.com/docker/docker/pkg/plugingetter"
@@ -749,7 +750,7 @@ func NewDaemon(config *config.Config, registryService registry.Service, containe
 
 	for operatingSystem, gd := range d.graphDrivers {
 		layerStores[operatingSystem], err = layer.NewStoreFromOptions(layer.StoreOptions{
-			Root: config.Root,
+			Root:                      config.Root,
 			MetadataStorePathTemplate: filepath.Join(config.Root, "image", "%s", "layerdb"),
 			GraphDriver:               gd,
 			GraphDriverOptions:        config.GraphOptions,

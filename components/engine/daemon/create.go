@@ -53,16 +53,19 @@ func (daemon *Daemon) containerCreate(params types.ContainerCreateConfig, manage
 		}
 	}
 
+	// 检查container配置是否合法
 	warnings, err := daemon.verifyContainerSettings(os, params.HostConfig, params.Config, false)
 	if err != nil {
 		return containertypes.ContainerCreateCreatedBody{Warnings: warnings}, errdefs.InvalidParameter(err)
 	}
 
+	// 检查network的配置
 	err = verifyNetworkingConfig(params.NetworkingConfig)
 	if err != nil {
 		return containertypes.ContainerCreateCreatedBody{Warnings: warnings}, errdefs.InvalidParameter(err)
 	}
 
+	// 默认HostConfig配置
 	if params.HostConfig == nil {
 		params.HostConfig = &containertypes.HostConfig{}
 	}
@@ -71,6 +74,7 @@ func (daemon *Daemon) containerCreate(params types.ContainerCreateConfig, manage
 		return containertypes.ContainerCreateCreatedBody{Warnings: warnings}, errdefs.InvalidParameter(err)
 	}
 
+	// 创建container
 	container, err := daemon.create(params, managed)
 	if err != nil {
 		return containertypes.ContainerCreateCreatedBody{Warnings: warnings}, err
@@ -122,6 +126,7 @@ func (daemon *Daemon) create(params types.ContainerCreateConfig, managed bool) (
 		return nil, errdefs.InvalidParameter(err)
 	}
 
+	// 创建新的Container对象
 	if container, err = daemon.newContainer(params.Name, os, params.Config, params.HostConfig, imgID, managed); err != nil {
 		return nil, err
 	}
@@ -156,6 +161,7 @@ func (daemon *Daemon) create(params types.ContainerCreateConfig, managed bool) (
 		}
 	}
 
+	// 创建container需要的rw layer, 设置到container.RWLayer中
 	// Set RWLayer for container after mount labels have been set
 	rwLayer, err := daemon.imageService.CreateLayer(container, setupInitLayer(daemon.idMappings))
 	if err != nil {

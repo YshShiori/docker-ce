@@ -29,7 +29,8 @@ type Puller interface {
 // whether a v1 or v2 puller will be created. The other parameters are passed
 // through to the underlying puller implementation for use during the actual
 // pull operation.
-func newPuller(endpoint registry.APIEndpoint, repoInfo *registry.RepositoryInfo, imagePullConfig *ImagePullConfig) (Puller, error) {
+func newPuller(endpoint registry.APIEndpoint, repoInfo *registry.RepositoryInfo,
+	imagePullConfig *ImagePullConfig) (Puller, error) {
 	switch endpoint.Version {
 	case registry.APIVersion2:
 		return &v2Puller{
@@ -63,7 +64,9 @@ func Pull(ctx context.Context, ref reference.Named, imagePullConfig *ImagePullCo
 		return err
 	}
 
-	endpoints, err := imagePullConfig.RegistryService.LookupPullEndpoints(reference.Domain(repoInfo.Name))
+	// 寻找多个remote API endpoint
+	endpoints, err := imagePullConfig.RegistryService.LookupPullEndpoints(
+		reference.Domain(repoInfo.Name))
 	if err != nil {
 		return err
 	}
@@ -90,7 +93,10 @@ func Pull(ctx context.Context, ref reference.Named, imagePullConfig *ImagePullCo
 		// retry for any of these.
 		confirmedTLSRegistries = make(map[string]struct{})
 	)
+
+	// 对每个endpoint, 尝试去pull image
 	for _, endpoint := range endpoints {
+		// 一些检查
 		if imagePullConfig.RequireSchema2 && endpoint.Version == registry.APIVersion1 {
 			continue
 		}
@@ -109,6 +115,7 @@ func Pull(ctx context.Context, ref reference.Named, imagePullConfig *ImagePullCo
 
 		logrus.Debugf("Trying to pull %s from %s %s", reference.FamiliarName(repoInfo.Name), endpoint.URL, endpoint.Version)
 
+		// 创建Puller, 用于拉取image
 		puller, err := newPuller(endpoint, repoInfo, imagePullConfig)
 		if err != nil {
 			lastErr = err
@@ -120,6 +127,9 @@ func Pull(ctx context.Context, ref reference.Named, imagePullConfig *ImagePullCo
 			imagePullConfig.OS = runtime.GOOS
 		}
 
+		// 执行puller.Pull操作
+		// 	如果pull成功, 那么直接return nil;
+		//	如果pull失败, 那么继续尝试endpoint
 		if err := puller.Pull(ctx, ref, imagePullConfig.OS); err != nil {
 			// Was this pull cancelled? If so, don't try to fall
 			// back.

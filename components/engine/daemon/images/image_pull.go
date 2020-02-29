@@ -19,7 +19,9 @@ import (
 
 // PullImage initiates a pull operation. image is the repository name to pull, and
 // tag may be either empty, or indicate a specific tag to pull.
-func (i *ImageService) PullImage(ctx context.Context, image, tag, os string, metaHeaders map[string][]string, authConfig *types.AuthConfig, outStream io.Writer) error {
+func (i *ImageService) PullImage(ctx context.Context, image, tag, os string,
+	metaHeaders map[string][]string, authConfig *types.AuthConfig, outStream io.Writer) error {
+	// 解析image 与 tag
 	// Special case: "pull -a" may send an image name with a
 	// trailing :. This is ugly, but let's not break API
 	// compatibility.
