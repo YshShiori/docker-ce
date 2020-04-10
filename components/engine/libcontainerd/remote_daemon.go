@@ -66,6 +66,7 @@ func New(rootDir, stateDir string, options ...RemoteOption) (rem Remote, err err
 		}
 	}()
 
+	// 构造remote对象
 	r := &remote{
 		rootDir:  rootDir,
 		stateDir: stateDir,
@@ -79,18 +80,23 @@ func New(rootDir, stateDir string, options ...RemoteOption) (rem Remote, err err
 	}
 	r.shutdownContext, r.shutdownCancel = context.WithCancel(context.Background())
 
+	// opts处理
 	rem = r
 	for _, option := range options {
 		if err = option.Apply(r); err != nil {
 			return
 		}
 	}
+
+	// 设置一些默认参数
 	r.setDefaults()
 
+	// 创建stateDir目录
 	if err = system.MkdirAll(stateDir, 0700, ""); err != nil {
 		return
 	}
 
+	// 如果指定<startDaemon>, 启动containerd
 	if r.startDaemon {
 		os.Remove(r.GRPC.Address)
 		if err = r.startContainerd(); err != nil {
@@ -103,6 +109,7 @@ func New(rootDir, stateDir string, options ...RemoteOption) (rem Remote, err err
 		}()
 	}
 
+	// 创建containerd.Client, 调用Client.Version()测试一下连接
 	// This connection is just used to monitor the connection
 	client, err := containerd.New(r.GRPC.Address)
 	if err != nil {
@@ -113,12 +120,14 @@ func New(rootDir, stateDir string, options ...RemoteOption) (rem Remote, err err
 		return nil, errors.Wrapf(err, "unable to get containerd version")
 	}
 
+	// 通过这个client, 周期性监控containerd是否健康
 	go r.monitorConnection(client)
 
 	return r, nil
 }
 
 func (r *remote) NewClient(ns string, b Backend) (Client, error) {
+	// 创建client实例
 	c := &client{
 		stateDir:   r.stateDir,
 		logger:     r.logger.WithField("namespace", ns),
@@ -127,14 +136,17 @@ func (r *remote) NewClient(ns string, b Backend) (Client, error) {
 		containers: make(map[string]*container),
 	}
 
+	// 创建container.Client, 赋值到[client].remote
 	rclient, err := containerd.New(r.GRPC.Address, containerd.WithDefaultNamespace(ns))
 	if err != nil {
 		return nil, err
 	}
 	c.remote = rclient
 
+	// 通过 container.Client.EventService().Subscribe() 订阅namespace下的所有event
 	go c.processEventStream(r.shutdownContext)
 
+	// 记录到<clients>
 	r.Lock()
 	r.clients = append(r.clients, c)
 	r.Unlock()
@@ -203,6 +215,7 @@ func (r *remote) getContainerdConfig() (string, error) {
 }
 
 func (r *remote) startContainerd() error {
+	// 读取已经运行着的container pid
 	pid, err := r.getContainerdPid()
 	if err != nil {
 		return err
@@ -220,6 +233,7 @@ func (r *remote) startContainerd() error {
 		return err
 	}
 
+	// 启动containerd!
 	args := []string{"--config", configFile}
 	cmd := exec.Command(binaryName, args...)
 	// redirect containerd logs to docker logs
@@ -237,6 +251,7 @@ func (r *remote) startContainerd() error {
 		return err
 	}
 
+	// 启动goroutine, 阻塞等待containerd进程退出, 并通过<daemonWaitCh>通知
 	r.daemonWaitCh = make(chan struct{})
 	go func() {
 		// Reap our child when needed
@@ -246,8 +261,10 @@ func (r *remote) startContainerd() error {
 		close(r.daemonWaitCh)
 	}()
 
+	// 记录pid至<daemonPid>
 	r.daemonPid = cmd.Process.Pid
 
+	// 将pid写入到"docker-containerd.pid"文件
 	err = ioutil.WriteFile(filepath.Join(r.stateDir, pidFile), []byte(fmt.Sprintf("%d", r.daemonPid)), 0660)
 	if err != nil {
 		system.KillProcess(r.daemonPid)
@@ -266,12 +283,14 @@ func (r *remote) monitorConnection(monitor *containerd.Client) {
 	for {
 		select {
 		case <-r.shutdownContext.Done():
+			// 收到关闭remote请求, 关闭client
 			r.logger.Info("stopping healthcheck following graceful shutdown")
 			monitor.Close()
 			return
 		case <-time.After(500 * time.Millisecond):
 		}
 
+		// 通过 client.IsServing() 检查containerd是否健康
 		ctx, cancel := context.WithTimeout(r.shutdownContext, healthCheckTimeout)
 		_, err := monitor.IsServing(ctx)
 		cancel()
@@ -294,6 +313,7 @@ func (r *remote) monitorConnection(monitor *containerd.Client) {
 			continue
 		}
 
+		// 如果失败次数超过阈值, kill containerd进程
 		transientFailureCount++
 		if transientFailureCount < maxConnectionRetryCount || system.IsProcessAlive(r.daemonPid) {
 			continue
@@ -309,6 +329,7 @@ func (r *remote) monitorConnection(monitor *containerd.Client) {
 		}
 		<-r.daemonWaitCh
 
+		// 重新启动containerd进程
 		monitor.Close()
 		os.Remove(r.GRPC.Address)
 		if err := r.startContainerd(); err != nil {
@@ -316,6 +337,7 @@ func (r *remote) monitorConnection(monitor *containerd.Client) {
 			continue
 		}
 
+		// 重新构建client
 		newMonitor, err := containerd.New(r.GRPC.Address)
 		if err != nil {
 			r.logger.WithError(err).Error("failed connect to containerd")
@@ -325,6 +347,8 @@ func (r *remote) monitorConnection(monitor *containerd.Client) {
 		monitor = newMonitor
 		var wg sync.WaitGroup
 
+		// 所有client重新赋值新的连接
+		// WARN: 这里当前版本应该是有bug, container等结构中client可能不会更新
 		for _, c := range r.clients {
 			wg.Add(1)
 
@@ -333,6 +357,7 @@ func (r *remote) monitorConnection(monitor *containerd.Client) {
 				c.logger.WithField("namespace", c.namespace).Debug("creating new containerd remote client")
 				c.remote.Close()
 
+				// 创建新的containerd.Client
 				remote, err := containerd.New(r.GRPC.Address, containerd.WithDefaultNamespace(c.namespace))
 				if err != nil {
 					r.logger.WithError(err).Error("failed to connect to containerd")
@@ -342,6 +367,7 @@ func (r *remote) monitorConnection(monitor *containerd.Client) {
 					return
 				}
 
+				// 赋值到client.remote
 				c.setRemote(remote)
 			}(c)
 

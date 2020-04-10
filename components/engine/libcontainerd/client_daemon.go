@@ -144,11 +144,13 @@ func (c *client) Restore(ctx context.Context, id string, attachStdio StdioCallba
 		err = wrapError(err)
 	}()
 
+	// 调用remote load container, 加载container信息
 	ctr, err := c.remote.LoadContainer(ctx, id)
 	if err != nil {
 		return false, -1, errors.WithStack(err)
 	}
 
+	// 貌似是 stdout的打印?
 	attachIO := func(fifos *cio.FIFOSet) (cio.IO, error) {
 		// dio must be assigned to the previously defined dio for the defer above
 		// to handle cleanup
@@ -158,11 +160,13 @@ func (c *client) Restore(ctx context.Context, id string, attachStdio StdioCallba
 		}
 		return attachStdio(dio)
 	}
+	// 得到容器的containerd.Task
 	t, err := ctr.Task(ctx, attachIO)
 	if err != nil && !containerderrors.IsNotFound(err) {
 		return false, -1, err
 	}
 
+	// 如果容器已经运行了, 记录其Task信息
 	if t != nil {
 		s, err := t.Status(ctx)
 		if err != nil {
@@ -189,10 +193,12 @@ func (c *client) Restore(ctx context.Context, id string, attachStdio StdioCallba
 }
 
 func (c *client) Create(ctx context.Context, id string, ociSpec *specs.Spec, runtimeOptions interface{}) error {
+	// 确认id没有使用
 	if ctr := c.getContainer(id); ctr != nil {
 		return errors.WithStack(newConflictError("id already in use"))
 	}
 
+	// 准备bundle目录, 路径为 <stateDir>/id/
 	bdir, err := prepareBundleDir(filepath.Join(c.stateDir, id), ociSpec)
 	if err != nil {
 		return errdefs.System(errors.Wrap(err, "prepare bundle dir failed"))
@@ -200,6 +206,8 @@ func (c *client) Create(ctx context.Context, id string, ociSpec *specs.Spec, run
 
 	c.logger.WithField("bundle", bdir).WithField("root", ociSpec.Root.Path).Debug("bundle dir created")
 
+	// 调用<remote>.NewContainer()
+	// 可以看到指定了runtime为 "io.containerd.runtime.v1.linux"
 	cdCtr, err := c.getRemote().NewContainer(ctx, id,
 		containerd.WithSpec(ociSpec),
 		// TODO(mlaventure): when containerd support lcow, revisit runtime value
@@ -208,6 +216,7 @@ func (c *client) Create(ctx context.Context, id string, ociSpec *specs.Spec, run
 		return wrapError(err)
 	}
 
+	// 记录container结构
 	c.Lock()
 	c.containers[id] = &container{
 		bundleDir: bdir,
@@ -219,11 +228,14 @@ func (c *client) Create(ctx context.Context, id string, ociSpec *specs.Spec, run
 }
 
 // Start create and start a task for the specified containerd id
-func (c *client) Start(ctx context.Context, id, checkpointDir string, withStdin bool, attachStdio StdioCallback) (int, error) {
+func (c *client) Start(ctx context.Context, id, checkpointDir string, withStdin bool,
+	attachStdio StdioCallback) (int, error) {
+	// 确认container存在
 	ctr := c.getContainer(id)
 	if ctr == nil {
 		return -1, errors.WithStack(newNotFoundError("no such container"))
 	}
+	// 确认的containerd.Task结构不存在, 也就代表着容器没有运行
 	if t := ctr.getTask(); t != nil {
 		return -1, errors.WithStack(newConflictError("container already started"))
 	}
@@ -236,6 +248,7 @@ func (c *client) Start(ctx context.Context, id, checkpointDir string, withStdin 
 		stdinCloseSync = make(chan struct{})
 	)
 
+	// checkpoint相关
 	if checkpointDir != "" {
 		// write checkpoint to the content store
 		tar := archive.Diff(ctx, "", checkpointDir)
@@ -260,11 +273,14 @@ func (c *client) Start(ctx context.Context, id, checkpointDir string, withStdin 
 		}
 	}
 
+	// 得到container spec
 	spec, err := ctr.ctr.Spec(ctx)
 	if err != nil {
 		return -1, errors.Wrap(err, "failed to retrieve spec")
 	}
 	uid, gid := getSpecUser(spec)
+
+	// 通过containerd.Container.NewTask() 创建对应Task
 	t, err = ctr.ctr.NewTask(ctx,
 		func(id string) (cio.IO, error) {
 			fifos := newFIFOSet(ctr.bundleDir, InitProcessName, withStdin, spec.Process.Terminal)
@@ -289,11 +305,14 @@ func (c *client) Start(ctx context.Context, id, checkpointDir string, withStdin 
 		return -1, wrapError(err)
 	}
 
+	// Task 记录到container
 	ctr.setTask(t)
 
+	// 阻塞等待containerd中Task创建完毕
 	// Signal c.createIO that it can call CloseIO
 	close(stdinCloseSync)
 
+	// 调用containerd.Task.Start(), 运行容器
 	if err := t.Start(ctx); err != nil {
 		if _, err := t.Delete(ctx); err != nil {
 			c.logger.WithError(err).WithField("container", id).
@@ -303,19 +322,24 @@ func (c *client) Start(ctx context.Context, id, checkpointDir string, withStdin 
 		return -1, wrapError(err)
 	}
 
+	// 返回init进程pid
 	return int(t.Pid()), nil
 }
 
-func (c *client) Exec(ctx context.Context, containerID, processID string, spec *specs.Process, withStdin bool, attachStdio StdioCallback) (int, error) {
+func (c *client) Exec(ctx context.Context, containerID, processID string,
+	spec *specs.Process, withStdin bool, attachStdio StdioCallback) (int, error) {
+	// 在<containers>中得到对应container
 	ctr := c.getContainer(containerID)
 	if ctr == nil {
 		return -1, errors.WithStack(newNotFoundError("no such container"))
 	}
+	// 确认容器已经运行
 	t := ctr.getTask()
 	if t == nil {
 		return -1, errors.WithStack(newInvalidParameterError("container is not running"))
 	}
 
+	// 确认id没有被使用
 	if p := ctr.getProcess(processID); p != nil {
 		return -1, errors.WithStack(newConflictError("id already in use"))
 	}
@@ -338,6 +362,7 @@ func (c *client) Exec(ctx context.Context, containerID, processID string, spec *
 		}
 	}()
 
+	// 执行 containerd.Task.Exec() 创建对应exec Process (不运行)
 	p, err = t.Exec(ctx, processID, spec, func(id string) (cio.IO, error) {
 		rio, err = c.createIO(fifos, containerID, processID, stdinCloseSync, attachStdio)
 		return rio, err
@@ -347,11 +372,13 @@ func (c *client) Exec(ctx context.Context, containerID, processID string, spec *
 		return -1, wrapError(err)
 	}
 
+	// 将对应 containerd.Process 记录到 container
 	ctr.addProcess(processID, p)
 
 	// Signal c.createIO that it can call CloseIO
 	close(stdinCloseSync)
 
+	// 调用 containerd.Process.Start() 运行Process
 	if err = p.Start(ctx); err != nil {
 		p.Delete(context.Background())
 		ctr.deleteProcess(processID)
@@ -475,11 +502,13 @@ func (c *client) DeleteTask(ctx context.Context, containerID string) (uint32, ti
 		return 255, time.Now(), nil
 	}
 
+	// 调用 containerd.Task.Delete()
 	status, err := p.(containerd.Task).Delete(ctx)
 	if err != nil {
 		return 255, time.Now(), nil
 	}
 
+	// container 取消记录task
 	if ctr := c.getContainer(containerID); ctr != nil {
 		ctr.setTask(nil)
 	}
@@ -492,10 +521,12 @@ func (c *client) Delete(ctx context.Context, containerID string) error {
 		return errors.WithStack(newNotFoundError("no such container"))
 	}
 
+	// 调用containerd.Container.Delete()
 	if err := ctr.ctr.Delete(ctx); err != nil {
 		return wrapError(err)
 	}
 
+	// 清理对应bundle目录
 	if os.Getenv("LIBCONTAINERD_NOCLEAN") != "1" {
 		if err := os.RemoveAll(ctr.bundleDir); err != nil {
 			c.logger.WithError(err).WithFields(logrus.Fields{
@@ -505,6 +536,7 @@ func (c *client) Delete(ctx context.Context, containerID string) error {
 		}
 	}
 
+	// <containers>移除对应container记录
 	c.removeContainer(containerID)
 
 	return nil
@@ -596,11 +628,13 @@ func (c *client) removeContainer(id string) {
 }
 
 func (c *client) getProcess(containerID, processID string) (containerd.Process, error) {
+	// 查找对应container
 	ctr := c.getContainer(containerID)
 	if ctr == nil {
 		return nil, errors.WithStack(newNotFoundError("no such container"))
 	}
 
+	// 判断是否返回containerd.Task对象
 	t := ctr.getTask()
 	if t == nil {
 		return nil, errors.WithStack(newNotFoundError("container is not running"))
@@ -609,6 +643,7 @@ func (c *client) getProcess(containerID, processID string) (containerd.Process, 
 		return t, nil
 	}
 
+	// 查找对应containerd.Process
 	p := ctr.getProcess(processID)
 	if p == nil {
 		return nil, errors.WithStack(newNotFoundError("no such exec"))
