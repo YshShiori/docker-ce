@@ -33,12 +33,14 @@ func (daemon *Daemon) ContainerCreate(params types.ContainerCreateConfig) (conta
 	return daemon.containerCreate(params, false)
 }
 
-func (daemon *Daemon) containerCreate(params types.ContainerCreateConfig, managed bool) (containertypes.ContainerCreateCreatedBody, error) {
+func (daemon *Daemon) containerCreate(params types.ContainerCreateConfig,
+	managed bool) (containertypes.ContainerCreateCreatedBody, error) {
 	start := time.Now()
 	if params.Config == nil {
 		return containertypes.ContainerCreateCreatedBody{}, errdefs.InvalidParameter(errors.New("Config cannot be empty in order to create a container"))
 	}
 
+	// 确认runtime的os (以image所需要的优先)
 	os := runtime.GOOS
 	if params.Config.Image != "" {
 		img, err := daemon.imageService.GetImage(params.Config.Image)
@@ -53,19 +55,19 @@ func (daemon *Daemon) containerCreate(params types.ContainerCreateConfig, manage
 		}
 	}
 
-	// 检查container配置是否合法
+	// 检查容器配置参数
 	warnings, err := daemon.verifyContainerSettings(os, params.HostConfig, params.Config, false)
 	if err != nil {
 		return containertypes.ContainerCreateCreatedBody{Warnings: warnings}, errdefs.InvalidParameter(err)
 	}
 
-	// 检查network的配置
+	// 创建network配置参数
 	err = verifyNetworkingConfig(params.NetworkingConfig)
 	if err != nil {
 		return containertypes.ContainerCreateCreatedBody{Warnings: warnings}, errdefs.InvalidParameter(err)
 	}
 
-	// 默认HostConfig配置
+	// 相关参数调整计算
 	if params.HostConfig == nil {
 		params.HostConfig = &containertypes.HostConfig{}
 	}
@@ -74,13 +76,16 @@ func (daemon *Daemon) containerCreate(params types.ContainerCreateConfig, manage
 		return containertypes.ContainerCreateCreatedBody{Warnings: warnings}, errdefs.InvalidParameter(err)
 	}
 
-	// 创建container
+	// 调用<create>, 创建容器流程
 	container, err := daemon.create(params, managed)
 	if err != nil {
 		return containertypes.ContainerCreateCreatedBody{Warnings: warnings}, err
 	}
+
+	// trace记录
 	containerActions.WithValues("create").UpdateSince(start)
 
+	// 结果返回
 	return containertypes.ContainerCreateCreatedBody{ID: container.ID, Warnings: warnings}, nil
 }
 
@@ -93,6 +98,7 @@ func (daemon *Daemon) create(params types.ContainerCreateConfig, managed bool) (
 		err       error
 	)
 
+	// 确认os
 	os := runtime.GOOS
 	if params.Config.Image != "" {
 		img, err = daemon.imageService.GetImage(params.Config.Image)
@@ -118,6 +124,7 @@ func (daemon *Daemon) create(params types.ContainerCreateConfig, managed bool) (
 		}
 	}
 
+	// 一些参数合并与检查
 	if err := daemon.mergeAndVerifyConfig(params.Config, img); err != nil {
 		return nil, errdefs.InvalidParameter(err)
 	}
@@ -126,10 +133,12 @@ func (daemon *Daemon) create(params types.ContainerCreateConfig, managed bool) (
 		return nil, errdefs.InvalidParameter(err)
 	}
 
-	// 创建新的Container对象
+	// 创建 container.Container 对象
+	// 这里就构造出了完整参数的 container.Container (CreateTime 就是这里赋值)
 	if container, err = daemon.newContainer(params.Name, os, params.Config, params.HostConfig, imgID, managed); err != nil {
 		return nil, err
 	}
+	// 回滚清理所有container相关资源, 包括: 进程、layer、network 等
 	defer func() {
 		if retErr != nil {
 			if err := daemon.cleanupContainer(container, true, true); err != nil {
@@ -138,6 +147,7 @@ func (daemon *Daemon) create(params types.ContainerCreateConfig, managed bool) (
 		}
 	}()
 
+	// Security 相关参数
 	if err := daemon.setSecurityOptions(container, params.HostConfig); err != nil {
 		return nil, err
 	}
@@ -161,7 +171,8 @@ func (daemon *Daemon) create(params types.ContainerCreateConfig, managed bool) (
 		}
 	}
 
-	// 创建container需要的rw layer, 设置到container.RWLayer中
+	// 调用 ImageService.CreateLayer() 创建对应的rwlayer
+	// 第二个 setInitLayer() 指定了在init layer进行的初始化操作
 	// Set RWLayer for container after mount labels have been set
 	rwLayer, err := daemon.imageService.CreateLayer(container, setupInitLayer(daemon.idMappings))
 	if err != nil {
@@ -169,6 +180,9 @@ func (daemon *Daemon) create(params types.ContainerCreateConfig, managed bool) (
 	}
 	container.RWLayer = rwLayer
 
+	// 创建container元信息目录, 记录对应的配置信息
+	// 	root目录: "/var/lib/docker-latest/containers/[id]"
+	//	checkpoint目录: "[root]/checkpoint目录"
 	rootIDs := daemon.idMappings.RootPair()
 	if err := idtools.MkdirAndChown(container.Root, 0700, rootIDs); err != nil {
 		return nil, err
@@ -177,14 +191,17 @@ func (daemon *Daemon) create(params types.ContainerCreateConfig, managed bool) (
 		return nil, err
 	}
 
+	// 检查hostconfig, 写入hostconfig文件: "[root]/hostconfig.json"
 	if err := daemon.setHostConfig(container, params.HostConfig); err != nil {
 		return nil, err
 	}
 
+	// 检查config, 写入config文件: "[root]/config.v2.json"
 	if err := daemon.createContainerOSSpecificSettings(container, params.Config, params.HostConfig); err != nil {
 		return nil, err
 	}
 
+	// 网络相关配置检查与调整
 	var endpointsConfigs map[string]*networktypes.EndpointSettings
 	if params.NetworkingConfig != nil {
 		endpointsConfigs = params.NetworkingConfig.EndpointsConfig
@@ -194,6 +211,8 @@ func (daemon *Daemon) create(params types.ContainerCreateConfig, managed bool) (
 	runconfig.SetDefaultNetModeIfBlank(container.HostConfig)
 
 	daemon.updateContainerNetworkSettings(container, endpointsConfigs)
+
+	// 将container结果注册到daemon, 也就是记录下来 (记录到ContainerStore中)
 	if err := daemon.Register(container); err != nil {
 		return nil, err
 	}

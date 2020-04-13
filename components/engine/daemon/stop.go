@@ -17,17 +17,21 @@ import (
 // container is not found, is already stopped, or if there is a
 // problem stopping the container.
 func (daemon *Daemon) ContainerStop(name string, seconds *int) error {
+	// 得到对应的container对象
 	container, err := daemon.GetContainer(name)
 	if err != nil {
 		return err
 	}
+	// 检查状态是否是running, 只有running的容器可以被stop
 	if !container.IsRunning() {
 		return containerNotModifiedError{running: false}
 	}
+	// 决定stoptimeout
 	if seconds == nil {
 		stopTimeout := container.StopTimeout()
 		seconds = &stopTimeout
 	}
+	// 调用 containerStop() 停止容器
 	if err := daemon.containerStop(container, *seconds); err != nil {
 		return errdefs.System(errors.Wrapf(err, "cannot stop container: %s", name))
 	}
@@ -44,6 +48,8 @@ func (daemon *Daemon) containerStop(container *containerpkg.Container, seconds i
 		return nil
 	}
 
+	// 发送 配置/默认 的停止信号
+	// 没有配置的情况下信号为 SIGTERM
 	stopSignal := container.StopSignal()
 	// 1. Send a stop signal
 	if err := daemon.killPossiblyDeadProcess(container, stopSignal); err != nil {
@@ -68,12 +74,14 @@ func (daemon *Daemon) containerStop(container *containerpkg.Container, seconds i
 		}
 	}
 
+	// 阻塞等待容器退出, timeout为传入的[second]
 	// 2. Wait for the process to exit on its own
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(seconds)*time.Second)
 	defer cancel()
 
 	if status := <-container.Wait(ctx, containerpkg.WaitConditionNotRunning); status.Err() != nil {
 		logrus.Infof("Container %v failed to exit within %d seconds of signal %d - using the force", container.ID, seconds, stopSignal)
+		// 如果没有等待容器正常退出通知, 直接发送SIGKILL信号
 		// 3. If it doesn't, then send SIGKILL
 		if err := daemon.Kill(container); err != nil {
 			// Wait without a timeout, ignore result.

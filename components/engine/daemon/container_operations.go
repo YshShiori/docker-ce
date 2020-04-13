@@ -514,22 +514,26 @@ func (daemon *Daemon) allocateNetwork(container *container.Container) error {
 		return nil
 	}
 
+	// 清理ID对应的以前的Sandbox环境(让一切重来)
 	// Cleanup any stale sandbox left over due to ungraceful daemon shutdown
 	if err := controller.SandboxDestroy(container.ID); err != nil {
 		logrus.Errorf("failed to cleanup up stale network sandbox for container %s", container.ID)
 	}
 
+	// 连接其他容器ns的直接返回成功
 	if container.Config.NetworkDisabled || container.HostConfig.NetworkMode.IsContainer() {
 		return nil
 	}
 
 	updateSettings := false
 
+	// 网络配置的一些调整
 	if len(container.NetworkSettings.Networks) == 0 {
 		daemon.updateContainerNetworkSettings(container, nil)
 		updateSettings = true
 	}
 
+	// 先连接至默认network("bridge"), 进行一些link的初始化
 	// always connect default network first since only default
 	// network mode support link and we need do some setting
 	// on sandbox initialize for link, but the sandbox only be initialized
@@ -543,6 +547,7 @@ func (daemon *Daemon) allocateNetwork(container *container.Container) error {
 
 	}
 
+	// copy NetworkSettings 副本, 因为connectToNetwork()函数会改变container.NetworkSettings
 	// the intermediate map is necessary because "connectToNetwork" modifies "container.NetworkSettings.Networks"
 	networks := make(map[string]*network.EndpointSettings)
 	for n, epConf := range container.NetworkSettings.Networks {
@@ -553,6 +558,7 @@ func (daemon *Daemon) allocateNetwork(container *container.Container) error {
 		networks[n] = epConf
 	}
 
+	// 遍历所有NetworkSettings, 调用connectToNetwork()一个个连接
 	for netName, epConf := range networks {
 		cleanOperationalData(epConf)
 		if err := daemon.connectToNetwork(container, netName, epConf.EndpointSettings, updateSettings); err != nil {
@@ -560,6 +566,7 @@ func (daemon *Daemon) allocateNetwork(container *container.Container) error {
 		}
 	}
 
+	// 如果container不连接任务network, 那么单独创建对应的 libnetwork.Sandbox
 	// If the container is not to be connected to any network,
 	// create its network sandbox now if not present
 	if len(networks) == 0 {
@@ -582,6 +589,7 @@ func (daemon *Daemon) allocateNetwork(container *container.Container) error {
 
 	}
 
+	// 整个网络准备好后, hostconfig有更新, 所以写入新的hostconfig
 	if _, err := container.WriteHostConfig(); err != nil {
 		return err
 	}
@@ -695,7 +703,8 @@ func (daemon *Daemon) updateNetworkConfig(container *container.Container, n libn
 	return nil
 }
 
-func (daemon *Daemon) connectToNetwork(container *container.Container, idOrName string, endpointConfig *networktypes.EndpointSettings, updateSettings bool) (err error) {
+func (daemon *Daemon) connectToNetwork(container *container.Container, idOrName string,
+	endpointConfig *networktypes.EndpointSettings, updateSettings bool) (err error) {
 	start := time.Now()
 	if container.HostConfig.NetworkMode.IsContainer() {
 		return runconfig.ErrConflictSharedNetwork
@@ -709,6 +718,8 @@ func (daemon *Daemon) connectToNetwork(container *container.Container, idOrName 
 		endpointConfig = &networktypes.EndpointSettings{}
 	}
 
+	// 得到container指定的 libnetwork.Network对象
+	// 通过 libnetwork.NetworkController.Networks() 接口
 	n, config, err := daemon.findAndAttachNetwork(container, idOrName, endpointConfig)
 	if err != nil {
 		return err
@@ -738,13 +749,17 @@ func (daemon *Daemon) connectToNetwork(container *container.Container, idOrName 
 		return err
 	}
 
+	// 得到对应的 libnetwork.NetworkController 与 libnetwork.Sandbox 对象
 	controller := daemon.netController
 	sb := daemon.getNetworkSandbox(container)
+
+	// 构建创建Endpoint的参数
 	createOptions, err := container.BuildCreateEndpointOptions(n, endpointConfig, sb, daemon.configStore.DNS)
 	if err != nil {
 		return err
 	}
 
+	// 调用 libnetwork.Network.CreateEndpoint() 创建对应Endpoint
 	endpointName := strings.TrimPrefix(container.Name, "/")
 	ep, err := n.CreateEndpoint(endpointName, createOptions...)
 	if err != nil {
@@ -752,11 +767,14 @@ func (daemon *Daemon) connectToNetwork(container *container.Container, idOrName 
 	}
 	defer func() {
 		if err != nil {
+			// 回滚删除endpoint
 			if e := ep.Delete(false); e != nil {
 				logrus.Warnf("Could not rollback container connection to network %s", idOrName)
 			}
 		}
 	}()
+
+	// Endpoint参数更新到container.NetworkSettings
 	container.NetworkSettings.Networks[n.Name()] = &network.EndpointSettings{
 		EndpointSettings: endpointConfig,
 		IPAMOperational:  operIPAM,
@@ -769,6 +787,7 @@ func (daemon *Daemon) connectToNetwork(container *container.Container, idOrName 
 		return err
 	}
 
+	// 如果对应的sandbox不存在, 那么通过 libnetwork.NetworkController.NewSandbox() 创建新的sandbox
 	if sb == nil {
 		options, err := daemon.buildSandboxOptions(container)
 		if err != nil {
@@ -782,6 +801,7 @@ func (daemon *Daemon) connectToNetwork(container *container.Container, idOrName 
 		container.UpdateSandboxNetworkSettings(sb)
 	}
 
+	// 调用 libnetwork.Endpoint.Join() 设置Sandbox的网络资源
 	joinOptions, err := container.BuildJoinOptions(n)
 	if err != nil {
 		return err
@@ -798,6 +818,7 @@ func (daemon *Daemon) connectToNetwork(container *container.Container, idOrName 
 		}
 	}
 
+	// 更新信息到container属性中
 	if err := container.UpdateJoinInfo(n, ep); err != nil {
 		return fmt.Errorf("Updating join info failed: %v", err)
 	}
@@ -893,23 +914,28 @@ func (daemon *Daemon) tryDetachContainerFromClusterNetwork(network libnetwork.Ne
 func (daemon *Daemon) initializeNetworking(container *container.Container) error {
 	var err error
 
+	// 单独处理: 容器需要加入其它容器的net ns
 	if container.HostConfig.NetworkMode.IsContainer() {
+		// 得到需要连接的container对象
 		// we need to get the hosts files from the container to join
 		nc, err := daemon.getNetworkedContainer(container.ID, container.HostConfig.NetworkMode.ConnectedContainer())
 		if err != nil {
 			return err
 		}
 
+		// 将container的 "ResolvConfPath"、"HostnamePath"、"HostsPath" 直接变为[nc]的对应路径
 		err = daemon.initializeNetworkingPaths(container, nc)
 		if err != nil {
 			return err
 		}
 
+		// 同样copy Hostname、Domainname
 		container.Config.Hostname = nc.Config.Hostname
 		container.Config.Domainname = nc.Config.Domainname
 		return nil
 	}
 
+	// 如果是host网络, host就是本机的
 	if container.HostConfig.NetworkMode.IsHost() {
 		if container.Config.Hostname == "" {
 			container.Config.Hostname, err = os.Hostname()
@@ -919,10 +945,12 @@ func (daemon *Daemon) initializeNetworking(container *container.Container) error
 		}
 	}
 
+	// 调用 libnetwork.NetworkController 进行网络的创建
 	if err := daemon.allocateNetwork(container); err != nil {
 		return err
 	}
 
+	// hostname写入container云信息目录下的"hostname"文件
 	return container.BuildHostnameFile()
 }
 

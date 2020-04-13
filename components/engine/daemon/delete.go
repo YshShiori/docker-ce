@@ -22,12 +22,16 @@ import (
 // fails. If the remove succeeds, the container name is released, and
 // network links are removed.
 func (daemon *Daemon) ContainerRm(name string, config *types.ContainerRmConfig) error {
+	// 得到对应container对象
 	start := time.Now()
 	container, err := daemon.GetContainer(name)
 	if err != nil {
 		return err
 	}
 
+	// 设置container状态为 RemovalInProgress (一种中间状态)
+	// 为了避免同时调用rm的竞争
+	// 在rm结束时会取消 RemovalInProgress 状态
 	// Container state RemovalInProgress should be used to avoid races.
 	if inProgress := container.SetRemovalInProgress(); inProgress {
 		err := fmt.Errorf("removal of container %s is already in progress", name)
@@ -35,15 +39,18 @@ func (daemon *Daemon) ContainerRm(name string, config *types.ContainerRmConfig) 
 	}
 	defer container.ResetRemovalInProgress()
 
+	// 再次得到对应container对象（两次检查）
 	// check if container wasn't deregistered by previous rm since Get
 	if c := daemon.containers.Get(container.ID); c == nil {
 		return nil
 	}
 
+	// rm指定删除link
 	if config.RemoveLink {
 		return daemon.rmLink(container, name)
 	}
 
+	// 停止容器, 清理相关资源
 	err = daemon.cleanupContainer(container, config.ForceRemove, config.RemoveVolume)
 	containerActions.WithValues("delete").UpdateSince(start)
 
@@ -79,6 +86,7 @@ func (daemon *Daemon) rmLink(container *container.Container, name string) error 
 // cleanupContainer unregisters a container from the daemon, stops stats
 // collection and cleanly removes contents and metadata from the filesystem.
 func (daemon *Daemon) cleanupContainer(container *container.Container, forceRemove, removeVolume bool) (err error) {
+	// 如果容器是running状态, 并且指定了forceRemove, 那么停止容器(直接使用SIGKILL)
 	if container.IsRunning() {
 		if !forceRemove {
 			state := container.StateString()
@@ -93,18 +101,23 @@ func (daemon *Daemon) cleanupContainer(container *container.Container, forceRemo
 			return fmt.Errorf("Could not kill running container %s, cannot remove - %v", container.ID, err)
 		}
 	}
+	// 检查os
 	if !system.IsOSSupported(container.OS) {
 		return fmt.Errorf("cannot remove %s: %s ", container.ID, system.ErrNotSupportedOperatingSystem)
 	}
 
+	// 停止正在进行stats推送的其他goroutine
 	// stop collection of stats for the container regardless
 	// if stats are currently getting collected.
 	daemon.statsCollector.StopCollection(container)
 
+	// 进行容器的停止
+	// 上面处理了running状态的, 所以其他状态都会经过这里
 	if err = daemon.containerStop(container, 3); err != nil {
 		return err
 	}
 
+	// 加锁container的单独锁, 进行checkpoint(记录state至磁盘)
 	// Mark container dead. We don't want anybody to be restarting it.
 	container.Lock()
 	container.Dead = true
@@ -117,6 +130,7 @@ func (daemon *Daemon) cleanupContainer(container *container.Container, forceRemo
 	}
 	container.Unlock()
 
+	// 通过 ImageService.ReleaseLayer() 删除对应的rwlayer
 	// When container creation fails and `RWLayer` has not been created yet, we
 	// do not call `ReleaseRWLayer`
 	if container.RWLayer != nil {
@@ -129,12 +143,14 @@ func (daemon *Daemon) cleanupContainer(container *container.Container, forceRemo
 		container.RWLayer = nil
 	}
 
+	// 删除container对应的Root目录(/var/lib/docker/containers/[id])
 	if err := system.EnsureRemoveAll(container.Root); err != nil {
 		e := errors.Wrapf(err, "unable to remove filesystem for %s", container.ID)
 		container.SetRemovalError(e)
 		return e
 	}
 
+	// 各个store中删除对应记录
 	linkNames := daemon.linkIndex.delete(container)
 	selinuxFreeLxcContexts(container.ProcessLabel)
 	daemon.idIndex.Delete(container.ID)

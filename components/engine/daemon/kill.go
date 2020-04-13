@@ -64,12 +64,14 @@ func (daemon *Daemon) killWithSignal(container *containerpkg.Container, sig int)
 	container.Lock()
 	defer container.Unlock()
 
+	// 停止健康检查
 	daemon.stopHealthchecks(container)
 
 	if !container.Running {
 		return errNotRunning(container.ID)
 	}
 
+	// 判断容器是否需要进行unpause
 	var unpause bool
 	if container.Config.StopSignal != "" && syscall.Signal(sig) != syscall.SIGKILL {
 		containerStopSignal, err := signal.ParseSignal(container.Config.StopSignal)
@@ -96,6 +98,7 @@ func (daemon *Daemon) killWithSignal(container *containerpkg.Container, sig int)
 		return nil
 	}
 
+	// 通过containerd向容器发送信号
 	if err := daemon.kill(container, sig); err != nil {
 		if errdefs.IsNotFound(err) {
 			unpause = false
@@ -105,6 +108,8 @@ func (daemon *Daemon) killWithSignal(container *containerpkg.Container, sig int)
 		}
 	}
 
+	// 如果容器是pause状态, 那么先要resume
+	// 上一步发送的信号会在resume之后被处理
 	if unpause {
 		// above kill signal will be sent once resume is finished
 		if err := daemon.containerd.Resume(context.Background(), container.ID); err != nil {
@@ -176,5 +181,6 @@ func (daemon *Daemon) killPossiblyDeadProcess(container *containerpkg.Container,
 }
 
 func (daemon *Daemon) kill(c *containerpkg.Container, sig int) error {
+	// 通过 containerd.SignalProcess() 函数发送信号
 	return daemon.containerd.SignalProcess(context.Background(), c.ID, libcontainerd.InitProcessName, sig)
 }

@@ -15,16 +15,20 @@ import (
 )
 
 // ContainerStart starts a container.
-func (daemon *Daemon) ContainerStart(name string, hostConfig *containertypes.HostConfig, checkpoint string, checkpointDir string) error {
+func (daemon *Daemon) ContainerStart(name string, hostConfig *containertypes.HostConfig,
+	checkpoint string, checkpointDir string) error {
 	if checkpoint != "" && !daemon.HasExperimental() {
 		return errdefs.InvalidParameter(errors.New("checkpoint is only supported in experimental mode"))
 	}
 
+	// 从 ContainerStore 与 TruncIndex 中得到name对应的container对象
 	container, err := daemon.GetContainer(name)
 	if err != nil {
 		return err
 	}
 
+	// 检查State合法
+	// Pasued、Running、RemovalInProgress、Dead 状态不能调用start
 	validateState := func() error {
 		container.Lock()
 		defer container.Unlock()
@@ -47,6 +51,7 @@ func (daemon *Daemon) ContainerStart(name string, hostConfig *containertypes.Hos
 		return err
 	}
 
+	// container的hostconfig配置
 	// Windows does not have the backwards compatibility issue here.
 	if runtime.GOOS != "windows" {
 		// This is kept for backward compatibility - hostconfig should be passed when
@@ -80,6 +85,7 @@ func (daemon *Daemon) ContainerStart(name string, hostConfig *containertypes.Hos
 		}
 	}
 
+	// 检查hostconfig
 	// check if hostConfig is in line with the current system settings.
 	// It may happen cgroups are umounted or the like.
 	if _, err = daemon.verifyContainerSettings(container.OS, container.HostConfig, nil, false); err != nil {
@@ -92,6 +98,8 @@ func (daemon *Daemon) ContainerStart(name string, hostConfig *containertypes.Hos
 			return errdefs.InvalidParameter(err)
 		}
 	}
+
+	// 调用 containeStart 真实开始
 	return daemon.containerStart(container, checkpoint, checkpointDir, true)
 }
 
@@ -99,11 +107,13 @@ func (daemon *Daemon) ContainerStart(name string, hostConfig *containertypes.Hos
 // container needs, such as storage and networking, as well as links
 // between containers. The container is left waiting for a signal to
 // begin running.
-func (daemon *Daemon) containerStart(container *container.Container, checkpoint string, checkpointDir string, resetRestartManager bool) (err error) {
+func (daemon *Daemon) containerStart(container *container.Container,
+	checkpoint string, checkpointDir string, resetRestartManager bool) (err error) {
 	start := time.Now()
 	container.Lock()
 	defer container.Unlock()
 
+	// 保证状态
 	if resetRestartManager && container.Running { // skip this check if already in restarting step and resetRestartManager==false
 		return nil
 	}
@@ -117,6 +127,8 @@ func (daemon *Daemon) containerStart(container *container.Container, checkpoint 
 		return errdefs.Forbidden(errors.New("custom checkpointdir is not supported"))
 	}
 
+	// 回滚操作, 如果启动失败, 将失败信息记录到container的部分属性(Error, ExitError), 并且清理所有相关的资源
+	// 如果设置的--rm, 那么同时删除容器信息
 	// if we encounter an error during start we need to ensure that any other
 	// setup has been cleaned up properly
 	defer func() {
@@ -131,7 +143,9 @@ func (daemon *Daemon) containerStart(container *container.Container, checkpoint 
 			}
 			container.Reset(false)
 
+			// 清理容器相关资源
 			daemon.Cleanup(container)
+			// 自动remove container
 			// if containers AutoRemove flag is set, remove it after clean up
 			if container.HostConfig.AutoRemove {
 				container.Unlock()
@@ -143,19 +157,23 @@ func (daemon *Daemon) containerStart(container *container.Container, checkpoint 
 		}
 	}()
 
+	// 进行容器的rwlayer的union mount(依赖于graphdriver实现), 并将rootfs路径保存到 container.BaseFs属性中
 	if err := daemon.conditionalMountOnStart(container); err != nil {
 		return err
 	}
 
+	// 容器网络资源的准备
 	if err := daemon.initializeNetworking(container); err != nil {
 		return err
 	}
 
+	// 容器配置转变为spec
 	spec, err := daemon.createSpec(container)
 	if err != nil {
 		return errdefs.System(err)
 	}
 
+	// restart count置为0
 	if resetRestartManager {
 		container.ResetRestartManager(true)
 	}
@@ -171,16 +189,19 @@ func (daemon *Daemon) containerStart(container *container.Container, checkpoint 
 		}
 	}
 
+	// 构建libcontainerd创建容器需要的参数
 	createOptions, err := daemon.getLibcontainerdCreateOptions(container)
 	if err != nil {
 		return err
 	}
 
+	// 调用 libcontainerd.Client.Create() 通知containerd创建容器
 	err = daemon.containerd.Create(context.Background(), container.ID, spec, createOptions)
 	if err != nil {
 		return translateContainerdStartErr(container.Path, container.SetExitCode, err)
 	}
 
+	// 调用 libcontainerd.Client.Start() 启动容器
 	// TODO(mlaventure): we need to specify checkpoint options here
 	pid, err := daemon.containerd.Start(context.Background(), container.ID, checkpointDir,
 		container.StreamConfig.Stdin() != nil || container.Config.Tty,
@@ -193,11 +214,13 @@ func (daemon *Daemon) containerStart(container *container.Container, checkpoint 
 		return translateContainerdStartErr(container.Path, container.SetExitCode, err)
 	}
 
+	// 设置container状态为Run, 记录pid（这里记录StartTime）
 	container.SetRunning(pid, true)
 	container.HasBeenManuallyStopped = false
 	container.HasBeenStartedBefore = true
 	daemon.setStateCounter(container)
 
+	// 启动容器health check
 	daemon.initHealthMonitor(container)
 
 	if err := container.CheckpointTo(daemon.containersReplica); err != nil {
