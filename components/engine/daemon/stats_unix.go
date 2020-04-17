@@ -23,21 +23,25 @@ func (daemon *Daemon) getNetworkSandboxID(c *container.Container) (string, error
 }
 
 func (daemon *Daemon) getNetworkStats(c *container.Container) (map[string]types.NetworkStats, error) {
+	// 得到容器对应 sandboxid
 	sandboxID, err := daemon.getNetworkSandboxID(c)
 	if err != nil {
 		return nil, err
 	}
 
+	// 得到对应的 libnetwork.Sandbox 对象
 	sb, err := daemon.netController.SandboxByID(sandboxID)
 	if err != nil {
 		return nil, err
 	}
 
+	// 调用 libnetwork.Sandbox.Statistics() 统计信息
 	lnstats, err := sb.Statistics()
 	if err != nil {
 		return nil, err
 	}
 
+	// 解析信息返回
 	stats := make(map[string]types.NetworkStats)
 	// Convert libnetwork nw stats into api stats
 	for ifName, ifStats := range lnstats {

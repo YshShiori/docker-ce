@@ -30,7 +30,7 @@ func (daemon *Daemon) ContainerRm(name string, config *types.ContainerRmConfig) 
 	}
 
 	// 设置container状态为 RemovalInProgress (一种中间状态)
-	// 为了避免同时调用rm的竞争
+	// 为了避免同时调用docker命令的竞争
 	// 在rm结束时会取消 RemovalInProgress 状态
 	// Container state RemovalInProgress should be used to avoid races.
 	if inProgress := container.SetRemovalInProgress(); inProgress {

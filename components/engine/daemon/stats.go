@@ -18,10 +18,12 @@ import (
 
 // ContainerStats writes information about the container to the stream
 // given in the config object.
-func (daemon *Daemon) ContainerStats(ctx context.Context, prefixOrName string, config *backend.ContainerStatsConfig) error {
+func (daemon *Daemon) ContainerStats(ctx context.Context, prefixOrName string,
+	config *backend.ContainerStatsConfig) error {
 	// Engine API version (used for backwards compatibility)
 	apiVersion := config.Version
 
+	// 查询对应container
 	container, err := daemon.GetContainer(prefixOrName)
 	if err != nil {
 		return err
@@ -34,6 +36,7 @@ func (daemon *Daemon) ContainerStats(ctx context.Context, prefixOrName string, c
 			ID:   container.ID})
 	}
 
+	// 如果是stream式输出, 构建flusher(用于刷新屏幕)
 	outStream := config.OutStream
 	if config.Stream {
 		wf := ioutils.NewWriteFlusher(outStream)
@@ -42,6 +45,7 @@ func (daemon *Daemon) ContainerStats(ctx context.Context, prefixOrName string, c
 		outStream = wf
 	}
 
+	// 定义将数据转换为StatJson函数
 	var preCPUStats types.CPUStats
 	var preRead time.Time
 	getStatJSON := func(v interface{}) *types.StatsJSON {
@@ -57,19 +61,26 @@ func (daemon *Daemon) ContainerStats(ctx context.Context, prefixOrName string, c
 
 	enc := json.NewEncoder(outStream)
 
+	// 将container的stat请求注册到<statsCollector>中
+	// <statsCollector>会周期性地采集container信息, 通过[updates]chan返回过来
 	updates := daemon.subscribeToContainerStats(container)
 	defer daemon.unsubscribeToContainerStats(container, updates)
 
 	noStreamFirstFrame := true
 	for {
 		select {
+		// 从[updates]取得collector收集的数据
 		case v, ok := <-updates:
 			if !ok {
 				return nil
 			}
 
+			// copy数据到statsJSON
 			var statsJSON interface{}
 			statsJSONPost120 := getStatJSON(v)
+
+			// < 1.21版本, 会计算Networks相关协议
+			// > 1.21版本, 没有额外计算
 			if versions.LessThan(apiVersion, "1.21") {
 				if runtime.GOOS == "windows" {
 					return errors.New("API versions pre v1.21 do not support stats on Windows")
@@ -140,11 +151,13 @@ func (daemon *Daemon) unsubscribeToContainerStats(c *container.Container, ch cha
 
 // GetContainerStats collects all the stats published by a container
 func (daemon *Daemon) GetContainerStats(container *container.Container) (*types.StatsJSON, error) {
+	// 得到容器的stat信息
 	stats, err := daemon.stats(container)
 	if err != nil {
 		return nil, err
 	}
 
+	// 统计network stat信息
 	// We already have the network stats on Windows directly from HCS.
 	if !container.Config.NetworkDisabled && runtime.GOOS != "windows" {
 		if stats.Networks, err = daemon.getNetworkStats(container); err != nil {

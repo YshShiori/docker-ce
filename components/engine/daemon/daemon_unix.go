@@ -1247,9 +1247,11 @@ func copyBlkioEntry(entries []*containerd_cgroups.BlkIOEntry) []types.BlkioStatE
 }
 
 func (daemon *Daemon) stats(c *container.Container) (*types.StatsJSON, error) {
+	// 检查容器是否运行
 	if !c.IsRunning() {
 		return nil, errNotRunning(c.ID)
 	}
+	// 调用 containerd.Stats() 接口统计信息
 	cs, err := daemon.containerd.Stats(context.Background(), c.ID)
 	if err != nil {
 		if strings.Contains(err.Error(), "container not found") {

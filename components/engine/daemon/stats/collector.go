@@ -48,11 +48,13 @@ type supervisor interface {
 func (s *Collector) Collect(c *container.Container) chan interface{} {
 	s.m.Lock()
 	defer s.m.Unlock()
+	// 容器第一次被订阅, 创建对应的publisher对象
 	publisher, exists := s.publishers[c]
 	if !exists {
 		publisher = pubsub.NewPublisher(100*time.Millisecond, 1024)
 		s.publishers[c] = publisher
 	}
+	// 订阅publisher的所有信息, 通过返回值的channel推送
 	return publisher.Subscribe()
 }
 
@@ -72,7 +74,9 @@ func (s *Collector) Unsubscribe(c *container.Container, ch chan interface{}) {
 	s.m.Lock()
 	publisher := s.publishers[c]
 	if publisher != nil {
+		// 从publisher中移除对应channel
 		publisher.Evict(ch)
+		// 如果没有人订阅了, 移除对应publisher
 		if publisher.Len() == 0 {
 			delete(s.publishers, c)
 		}
@@ -91,14 +95,17 @@ func (s *Collector) Run() {
 	var pairs []publishersPair
 
 	for {
+		// 间隔时间
 		// Put sleep at the start so that it will always be hit,
 		// preventing a tight loop if no stats are collected.
 		time.Sleep(s.interval)
 
+		// pair对清零
 		// it does not make sense in the first iteration,
 		// but saves allocations in further iterations
 		pairs = pairs[:0]
 
+		// 读取<publishers>中所有的container与publisher对应
 		s.m.Lock()
 		for container, publisher := range s.publishers {
 			// copy pointers here to release the lock ASAP
@@ -109,17 +116,21 @@ func (s *Collector) Run() {
 			continue
 		}
 
+		// 读取host online cpu数量
 		onlineCPUs, err := s.getNumberOnlineCPUs()
 		if err != nil {
 			logrus.Errorf("collecting system online cpu count: %v", err)
 			continue
 		}
 
+		// 对于每个pair(其实就是每个container)
 		for _, pair := range pairs {
+			// 通过 supervisor.GetContainerStats() 得到container对应stat信息
 			stats, err := s.supervisor.GetContainerStats(pair.container)
 
 			switch err.(type) {
 			case nil:
+				// 读取systemcpu, 记录到stats
 				// Sample system CPU usage close to container usage to avoid
 				// noise in metric calculations.
 				systemUsage, err := s.getSystemCPUUsage()
@@ -132,9 +143,11 @@ func (s *Collector) Run() {
 				stats.CPUStats.SystemUsage = systemUsage
 				stats.CPUStats.OnlineCPUs = onlineCPUs
 
+				// 推送stats
 				pair.publisher.Publish(*stats)
 
 			case notRunningErr, notFoundErr:
+				// 对应container不存在, 推送 零值的stat信息
 				// publish empty stats containing only name and ID if not running or not found
 				pair.publisher.Publish(types.StatsJSON{
 					Name: pair.container.Name,
