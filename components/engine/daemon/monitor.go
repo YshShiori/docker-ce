@@ -33,7 +33,9 @@ func (daemon *Daemon) ProcessEvent(id string, e libcontainerd.EventType, ei libc
 		return fmt.Errorf("no such container: %s", id)
 	}
 
+	// 判断event事件
 	switch e {
+	// OOM事件, 更新
 	case libcontainerd.EventOOM:
 		// StateOOM is Linux specific and should never be hit on Windows
 		if runtime.GOOS == "windows" {
@@ -48,9 +50,12 @@ func (daemon *Daemon) ProcessEvent(id string, e libcontainerd.EventType, ei libc
 		}
 
 		daemon.LogContainerEvent(c, "oom")
+	// 容器退出事件
 	case libcontainerd.EventExit:
+		// 退出的是容器的init进程
 		if int(ei.Pid) == c.Pid {
 			c.Lock()
+			// 再次调用DeleteTask()停止主进程
 			_, _, err := daemon.containerd.DeleteTask(context.Background(), c.ID)
 			if err != nil {
 				logrus.WithError(err).Warnf("failed to delete container %s from containerd", c.ID)
@@ -64,6 +69,7 @@ func (daemon *Daemon) ProcessEvent(id string, e libcontainerd.EventType, ei libc
 				ExitedAt:  ei.ExitedAt,
 				OOMKilled: ei.OOMKilled,
 			}
+			// 判断是否需要restart
 			restart, wait, err := c.RestartManager().ShouldRestart(ei.ExitCode, daemon.IsShuttingDown() || c.HasBeenManuallyStopped, time.Since(c.StartedAt))
 			if err == nil && restart {
 				c.RestartCount++
@@ -77,6 +83,7 @@ func (daemon *Daemon) ProcessEvent(id string, e libcontainerd.EventType, ei libc
 			}
 			defer c.Unlock() // needs to be called before autoRemove
 
+			// 停止container的健康检查
 			// cancel healthcheck here, they will be automatically
 			// restarted if/when the container is started again
 			daemon.stopHealthchecks(c)
@@ -84,8 +91,11 @@ func (daemon *Daemon) ProcessEvent(id string, e libcontainerd.EventType, ei libc
 				"exitCode": strconv.Itoa(int(ei.ExitCode)),
 			}
 			daemon.LogContainerEventWithAttributes(c, "die", attributes)
+
+			// 执行 Cleanup() 清理相关资源
 			daemon.Cleanup(c)
 
+			// 如果需要restart, 执行 containerStart() 启动容器
 			if err == nil && restart {
 				go func() {
 					err := <-wait
@@ -114,6 +124,7 @@ func (daemon *Daemon) ProcessEvent(id string, e libcontainerd.EventType, ei libc
 			return c.CheckpointTo(daemon.containersReplica)
 		}
 
+		//
 		if execConfig := c.ExecCommands.Get(ei.ProcessID); execConfig != nil {
 			ec := int(ei.ExitCode)
 			execConfig.Lock()
@@ -140,6 +151,7 @@ func (daemon *Daemon) ProcessEvent(id string, e libcontainerd.EventType, ei libc
 				"exec-pid":  ei.Pid,
 			}).Warnf("Ignoring Exit Event, no such exec command found")
 		}
+	// 容器启动
 	case libcontainerd.EventStart:
 		c.Lock()
 		defer c.Unlock()

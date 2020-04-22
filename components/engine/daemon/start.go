@@ -237,12 +237,15 @@ func (daemon *Daemon) containerStart(container *container.Container,
 // Cleanup releases any network resources allocated to the container along with any rules
 // around how containers are linked together.  It also unmounts the container's root filesystem.
 func (daemon *Daemon) Cleanup(container *container.Container) {
+	// 清理网络相关
 	daemon.releaseNetwork(container)
 
+	// 取消ipc的挂载(shm目录的挂载)
 	if err := container.UnmountIpcMount(detachMounted); err != nil {
 		logrus.Warnf("%s cleanup: failed to unmount IPC: %s", container.ID, err)
 	}
 
+	// container rwlayer的umount
 	if err := daemon.conditionalUnmountOnCleanup(container); err != nil {
 		// FIXME: remove once reference counting for graphdrivers has been refactored
 		// Ensure that all the mounts are gone
@@ -251,18 +254,22 @@ func (daemon *Daemon) Cleanup(container *container.Container) {
 		}
 	}
 
+	// 取消容器 secrets目录挂载
 	if err := container.UnmountSecrets(); err != nil {
 		logrus.Warnf("%s cleanup: failed to unmount secrets: %s", container.ID, err)
 	}
 
+	// 取消容器对应 元信息目录下的所有挂载
 	if err := mount.RecursiveUnmount(container.Root); err != nil {
 		logrus.WithError(err).WithField("container", container.ID).Warn("Error while cleaning up container resource mounts.")
 	}
 
+	// 删除所有 exec 的执行
 	for _, eConfig := range container.ExecCommands.Commands() {
 		daemon.unregisterExecCommand(container, eConfig)
 	}
 
+	// 取消所有 volume 挂载
 	if container.BaseFS != nil && container.BaseFS.Path() != "" {
 		if err := container.UnmountVolumes(daemon.LogVolumeEvent); err != nil {
 			logrus.Warnf("%s cleanup: Failed to umount volumes: %v", container.ID, err)
@@ -271,6 +278,7 @@ func (daemon *Daemon) Cleanup(container *container.Container) {
 
 	container.CancelAttachContext()
 
+	// 调用 containerd.Delete() 停止删除containerd中对应container的记录
 	if err := daemon.containerd.Delete(context.Background(), container.ID); err != nil {
 		logrus.Errorf("%s cleanup: failed to delete container from containerd: %v", container.ID, err)
 	}

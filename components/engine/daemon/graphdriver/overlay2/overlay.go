@@ -122,11 +122,14 @@ func init() {
 // If an overlay filesystem is not supported over an existing filesystem then
 // the error graphdriver.ErrIncompatibleFS is returned.
 func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (graphdriver.Driver, error) {
+	// 参数解析
 	opts, err := parseOptions(options)
 	if err != nil {
 		return nil, err
 	}
 
+	// 判断os是否支持overlay
+	// (/proc/filesystems 包含overlay)
 	if err := supportsOverlay(); err != nil {
 		return nil, graphdriver.ErrNotSupported
 	}
@@ -137,6 +140,7 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 		return nil, err
 	}
 
+	// 得到 overlay home目录的 后端fs 类型
 	// Perform feature detection on /var/lib/docker/overlay2 if it's an existing directory.
 	// This covers situations where /var/lib/docker/overlay2 is a mount, and on a different
 	// filesystem than /var/lib/docker.
@@ -154,8 +158,10 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 		backingFs = fsName
 	}
 
+	// 检查 后端fs 是否合适
 	switch fsMagic {
-	case graphdriver.FsMagicAufs, graphdriver.FsMagicEcryptfs, graphdriver.FsMagicNfsFs, graphdriver.FsMagicOverlay, graphdriver.FsMagicZfs:
+	case graphdriver.FsMagicAufs, graphdriver.FsMagicEcryptfs, graphdriver.FsMagicNfsFs,
+		graphdriver.FsMagicOverlay, graphdriver.FsMagicZfs:
 		logrus.Errorf("'overlay2' is not supported over %s", backingFs)
 		return nil, graphdriver.ErrIncompatibleFS
 	case graphdriver.FsMagicBtrfs:
@@ -170,6 +176,7 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 		}
 	}
 
+	// 内核需要大于 4.0.0
 	if kernel.CompareKernelVersion(*v, kernel.VersionInfo{Kernel: 4, Major: 0, Minor: 0}) < 0 {
 		if opts.overrideKernelCheck {
 			logrus.Warn("Using pre-4.0.0 kernel for overlay2, mount failures may require kernel update")
@@ -192,15 +199,19 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 		logrus.Warn(overlayutils.ErrDTypeNotSupported("overlay2", backingFs))
 	}
 
+	// 得到 uid、gid maps
 	rootUID, rootGID, err := idtools.GetRootUIDGID(uidMaps, gidMaps)
 	if err != nil {
 		return nil, err
 	}
+
+	// 创建 driver home目录
 	// Create the driver home dir
 	if err := idtools.MkdirAllAndChown(path.Join(home, linkDir), 0700, idtools.IDPair{rootUID, rootGID}); err != nil {
 		return nil, err
 	}
 
+	// 构建Driver对象
 	d := &Driver{
 		home:          home,
 		uidMaps:       uidMaps,
@@ -213,6 +224,7 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 
 	d.naiveDiff = graphdriver.NewNaiveDiffDriver(d, uidMaps, gidMaps)
 
+	// 如果 后端fs 是xfs, 还支持quota特性, 设置quotaCtl
 	if backingFs == "xfs" {
 		// Try to enable project quota support over xfs.
 		if d.quotaCtl, err = quota.NewControl(home); err == nil {
@@ -337,16 +349,19 @@ func (d *Driver) Cleanup() error {
 // CreateReadWrite creates a layer that is writable for use as a container
 // file system.
 func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts) error {
+	// 判断quota是否能够支持
 	if opts != nil && len(opts.StorageOpt) != 0 && !projectQuotaSupported {
 		return fmt.Errorf("--storage-opt is supported only for overlay over xfs with 'pquota' mount option")
 	}
 
+	// 默认opts
 	if opts == nil {
 		opts = &graphdriver.CreateOpts{
 			StorageOpt: map[string]string{},
 		}
 	}
 
+	// 参数转换
 	if _, ok := opts.StorageOpt["size"]; !ok {
 		if opts.StorageOpt == nil {
 			opts.StorageOpt = map[string]string{}
@@ -354,6 +369,7 @@ func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts
 		opts.StorageOpt["size"] = strconv.FormatUint(d.options.quota.Size, 10)
 	}
 
+	// 调用 create() 创建
 	return d.create(id, parent, opts)
 }
 
@@ -369,6 +385,7 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 }
 
 func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr error) {
+	// home + id 得到对应的 layer目录
 	dir := d.dir(id)
 
 	rootUID, rootGID, err := idtools.GetRootUIDGID(d.uidMaps, d.gidMaps)
@@ -377,6 +394,7 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 	}
 	root := idtools.IDPair{UID: rootUID, GID: rootGID}
 
+	// 创建对应的 layer目录
 	if err := idtools.MkdirAllAndChown(path.Dir(dir), 0700, root); err != nil {
 		return err
 	}
@@ -391,6 +409,7 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 		}
 	}()
 
+	// 指定使用quota, 调用 <quotaCtl>.SetQuota() 在layer目录下设置quota
 	if opts != nil && len(opts.StorageOpt) > 0 {
 		driver := &Driver{}
 		if err := d.parseStorageOpt(opts.StorageOpt, driver); err != nil {
@@ -405,15 +424,18 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 		}
 	}
 
+	// 创建 [layer目录]/diff 目录
 	if err := idtools.MkdirAndChown(path.Join(dir, "diff"), 0755, root); err != nil {
 		return err
 	}
 
+	// 创建随机的26位linkid, 将 [layer目录]/diff 软链到 [home]/l/[linkid]
 	lid := generateID(idLength)
 	if err := os.Symlink(path.Join("..", id, "diff"), path.Join(d.home, linkDir, lid)); err != nil {
 		return err
 	}
 
+	// 将 linkid 记录到 [layer目录]/link 文件
 	// Write link id to link file
 	if err := ioutil.WriteFile(path.Join(dir, "link"), []byte(lid), 0644); err != nil {
 		return err
@@ -424,10 +446,13 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 		return nil
 	}
 
+	// 创建 [layer目录]/work 目录
 	if err := idtools.MkdirAndChown(path.Join(dir, "work"), 0700, root); err != nil {
 		return err
 	}
 
+	// 得到所有的祖先layer目录的 linkid, 记录到 [layer目录]/lower 文件
+	// 其实就是读取 parentlayer目录的 lower文件
 	lower, err := d.getLower(parent)
 	if err != nil {
 		return err
@@ -469,13 +494,17 @@ func (d *Driver) getLower(parent string) (string, error) {
 		return "", err
 	}
 
+	// 读取 parentlayer目录 的 linkid
 	// Read Parent link fileA
 	parentLink, err := ioutil.ReadFile(path.Join(parentDir, "link"))
 	if err != nil {
 		return "", err
 	}
+
+	// 记录到 结果集
 	lowers := []string{path.Join(linkDir, string(parentLink))}
 
+	// 读取 parentlayer目录的 lower文件, 得到parent的 祖先目录, 解析记录到 结果集
 	parentLower, err := ioutil.ReadFile(path.Join(parentDir, lowerFile))
 	if err == nil {
 		parentLowers := strings.Split(string(parentLower), ":")
@@ -512,6 +541,7 @@ func (d *Driver) getLowerDirs(id string) ([]string, error) {
 func (d *Driver) Remove(id string) error {
 	d.locker.Lock(id)
 	defer d.locker.Unlock(id)
+	// 得到对应的linkid, 通过 删除对应的 [home]/l/[linkid]软链 删除整个目录
 	dir := d.dir(id)
 	lid, err := ioutil.ReadFile(path.Join(dir, "link"))
 	if err == nil {
@@ -520,6 +550,7 @@ func (d *Driver) Remove(id string) error {
 		}
 	}
 
+	// 确认删除(其目录下的所有挂载都会取消)
 	if err := system.EnsureRemoveAll(dir); err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -530,11 +561,14 @@ func (d *Driver) Remove(id string) error {
 func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr error) {
 	d.locker.Lock(id)
 	defer d.locker.Unlock(id)
+	// 检查对应 layer目录
 	dir := d.dir(id)
 	if _, err := os.Stat(dir); err != nil {
 		return nil, err
 	}
 
+	// diff目录路径, 得到祖先layer linkid
+	// 如果不存在lower目录, 说明是最底层, 不需要union挂载, 直接返回目录
 	diffDir := path.Join(dir, "diff")
 	lowers, err := ioutil.ReadFile(path.Join(dir, lowerFile))
 	if err != nil {
@@ -545,10 +579,12 @@ func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr e
 		return nil, err
 	}
 
+	// 如果 "[layer]/merged" 引用计数大于1, 说明已经被Get了, 直接返回ContainerFS对象
 	mergedDir := path.Join(dir, "merged")
 	if count := d.ctr.Increment(mergedDir); count > 1 {
 		return containerfs.NewLocalContainerFS(mergedDir), nil
 	}
+	// 回滚减少引用计数, 必要时删除unmount与remove merged目录
 	defer func() {
 		if retErr != nil {
 			if c := d.ctr.Decrement(mergedDir); c <= 0 {
@@ -563,17 +599,20 @@ func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr e
 		}
 	}()
 
+	// 生成挂载参数, target为 "[layer]/merged"
 	workDir := path.Join(dir, "work")
 	splitLowers := strings.Split(string(lowers), ":")
 	absLowers := make([]string, len(splitLowers))
 	for i, s := range splitLowers {
 		absLowers[i] = path.Join(d.home, s)
 	}
-	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", strings.Join(absLowers, ":"), path.Join(dir, "diff"), path.Join(dir, "work"))
+	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", strings.Join(absLowers, ":"),
+		path.Join(dir, "diff"), path.Join(dir, "work"))
 	mountData := label.FormatMountLabel(opts, mountLabel)
 	mount := unix.Mount
 	mountTarget := mergedDir
 
+	// 创建 mreged目录
 	rootUID, rootGID, err := idtools.GetRootUIDGID(d.uidMaps, d.gidMaps)
 	if err != nil {
 		return nil, err
@@ -593,6 +632,7 @@ func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr e
 		pageSize = 4096
 	}
 
+	// 处理 mount label
 	// Use relative paths and mountFrom when the mount data has exceeded
 	// the page size. The mount syscall fails if the mount data cannot
 	// fit within a page and relative links make the mount data much
@@ -610,6 +650,7 @@ func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr e
 		mountTarget = path.Join(id, "merged")
 	}
 
+	// 执行 overlayer文件系统的 mount
 	if err := mount("overlay", mountTarget, "overlay", 0, mountData); err != nil {
 		return nil, fmt.Errorf("error creating overlay mount to %s: %v", mergedDir, err)
 	}
@@ -629,6 +670,7 @@ func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr e
 func (d *Driver) Put(id string) error {
 	d.locker.Lock(id)
 	defer d.locker.Unlock(id)
+	// 读取 lower文件, 如果不存在, 那么不会有mount, 直接返回
 	dir := d.dir(id)
 	_, err := ioutil.ReadFile(path.Join(dir, lowerFile))
 	if err != nil {
@@ -639,10 +681,12 @@ func (d *Driver) Put(id string) error {
 		return err
 	}
 
+	// 判断 merged目录 引用计数, 大于0则不进行真正Put
 	mountpoint := path.Join(dir, "merged")
 	if count := d.ctr.Decrement(mountpoint); count > 0 {
 		return nil
 	}
+	// 执行umount [merged]目录
 	if err := unix.Unmount(mountpoint, unix.MNT_DETACH); err != nil {
 		logrus.Debugf("Failed to unmount %s overlay: %s - %v", id, mountpoint, err)
 	}
