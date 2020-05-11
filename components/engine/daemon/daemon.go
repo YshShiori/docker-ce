@@ -134,17 +134,21 @@ func (daemon *Daemon) HasExperimental() bool {
 }
 
 func (daemon *Daemon) restore() error {
+	// 保存所有上一次运行的container
 	containers := make(map[string]*container.Container)
 
 	logrus.Info("Loading containers: start.")
 
+	// 读取<repository>, 即容器的持久化信息目录, 默认为 "/var/lib/containers"
 	dir, err := ioutil.ReadDir(daemon.repository)
 	if err != nil {
 		return err
 	}
 
 	for _, v := range dir {
+		// 文件名就是容器id
 		id := v.Name()
+		// 从持久化文件加载得到 container.Container 结构
 		container, err := daemon.load(id)
 		if err != nil {
 			logrus.Errorf("Failed to load container %v: %v", id, err)
@@ -154,9 +158,12 @@ func (daemon *Daemon) restore() error {
 			logrus.Errorf("Failed to load container %v: %s (%q)", id, system.ErrNotSupportedOperatingSystem, container.OS)
 			continue
 		}
+
+		// 恢复与对应的 layer.RWLayer 的关系
 		// Ignore the container if it does not support the current driver being used by the graph
 		currentDriverForContainerOS := daemon.graphDrivers[container.OS]
 		if (container.Driver == "" && currentDriverForContainerOS == "aufs") || container.Driver == currentDriverForContainerOS {
+			// Get 对应的 layer.Layer 对象
 			rwlayer, err := daemon.imageService.GetLayerByID(container.ID, container.OS)
 			if err != nil {
 				logrus.Errorf("Failed to load container mount %v: %v", id, err)
@@ -165,32 +172,40 @@ func (daemon *Daemon) restore() error {
 			container.RWLayer = rwlayer
 			logrus.Debugf("Loaded container %v, isRunning: %v", container.ID, container.IsRunning())
 
+			// 记录到containers
 			containers[container.ID] = container
 		} else {
 			logrus.Debugf("Cannot load container %s because it was created with another graph driver.", container.ID)
 		}
 	}
 
+	// 创建需要使用结果集
 	removeContainers := make(map[string]*container.Container)
 	restartContainers := make(map[*container.Container]chan struct{})
 	activeSandboxes := make(map[string]interface{})
+	// 遍历所有容器, 将其注册到Daemon中
 	for id, c := range containers {
+		// 注册name到相关的模块中()
 		if err := daemon.registerName(c); err != nil {
 			logrus.Errorf("Failed to register container name %s: %s", c.ID, err)
 			delete(containers, id)
 			continue
 		}
+		// 检查对应的volume
 		// verify that all volumes valid and have been migrated from the pre-1.7 layout
 		if err := daemon.verifyVolumesInfo(c); err != nil {
 			// don't skip the container due to error
 			logrus.Errorf("Failed to verify volumes for container '%s': %v", c.ID, err)
 		}
+
+		// 保存到 <containers> <idIndex>, 就等于注册到Daemon中了
 		if err := daemon.Register(c); err != nil {
 			logrus.Errorf("Failed to register container %s: %s", c.ID, err)
 			delete(containers, id)
 			continue
 		}
 
+		// 兼容 1.12之前的默认log
 		// The LogConfig.Type is empty if the container was created before docker 1.12 with default log driver.
 		// We should rewrite it to use the daemon defaults.
 		// Fixes https://github.com/docker/docker/issues/22536
@@ -202,6 +217,7 @@ func (daemon *Daemon) restore() error {
 		}
 	}
 
+	// 恢复 container 中的所有属性
 	var (
 		wg      sync.WaitGroup
 		mapLock sync.Mutex
@@ -210,11 +226,13 @@ func (daemon *Daemon) restore() error {
 		wg.Add(1)
 		go func(c *container.Container) {
 			defer wg.Done()
+			// 兼容 1.13 之前的mount spec
 			daemon.backportMountSpec(c)
 			if err := daemon.checkpointAndSave(c); err != nil {
 				logrus.WithError(err).WithField("container", c.ID).Error("error saving backported mountspec to disk")
 			}
 
+			// <stateCtr> 设置对应状态
 			daemon.setStateCounter(c)
 
 			logrus.WithFields(logrus.Fields{
@@ -230,11 +248,13 @@ func (daemon *Daemon) restore() error {
 				exitedAt time.Time
 			)
 
+			// 执行 containerd.Restore, 恢复对应记录
 			alive, _, err = daemon.containerd.Restore(context.Background(), c.ID, c.InitializeStdio)
 			if err != nil && !errdefs.IsNotFound(err) {
 				logrus.Errorf("Failed to restore container %s with containerd: %s", c.ID, err)
 				return
 			}
+			// 容器进程不存在了, 那么删除containerd中对应容器记录
 			if !alive {
 				ec, exitedAt, err = daemon.containerd.DeleteTask(context.Background(), c.ID)
 				if err != nil && !errdefs.IsNotFound(err) {
@@ -242,15 +262,18 @@ func (daemon *Daemon) restore() error {
 					return
 				}
 			} else if !daemon.configStore.LiveRestoreEnabled {
+				// 如果daemon的"live-restore"关闭, 那么停止对应的容器
 				if err := daemon.kill(c, c.StopSignal()); err != nil && !errdefs.IsNotFound(err) {
 					logrus.WithError(err).WithField("container", c.ID).Error("error shutting down container")
 					return
 				}
 			}
 
+			// 如果容器是 Running 或者 Paused 状态（进程存在的情况）, 还要恢复一些信息
 			if c.IsRunning() || c.IsPaused() {
 				c.RestartManager().Cancel() // manually start containers because some need to wait for swarm networking
 
+				// Paused 状态的容器检查是否真正存活着
 				if c.IsPaused() && alive {
 					s, err := daemon.containerd.Status(context.Background(), c.ID)
 					if err != nil {
@@ -281,9 +304,12 @@ func (daemon *Daemon) restore() error {
 					}
 				}
 
+				// 如果容器不存在了, 清理其所有的资源
 				if !alive {
 					c.Lock()
+					// 设置状态
 					c.SetStopped(&container.ExitStatus{ExitCode: int(ec), ExitedAt: exitedAt})
+					// 清理其所有对应的资源
 					daemon.Cleanup(c)
 					if err := c.CheckpointTo(daemon.containersReplica); err != nil {
 						logrus.Errorf("Failed to update stopped container %s state: %v", c.ID, err)
@@ -291,6 +317,8 @@ func (daemon *Daemon) restore() error {
 					c.Unlock()
 				}
 
+				// 执行一次 layer.Mount 与 layer.Umount, 来赋值 container.BaseFs 属性
+				// (已经Mount的不会执行真正的mount, 而会计数+1)
 				// we call Mount and then Unmount to get BaseFs of the container
 				if err := daemon.Mount(c); err != nil {
 					// The mount is unlikely to fail. However, in case mount fails
@@ -306,6 +334,7 @@ func (daemon *Daemon) restore() error {
 					}
 				}
 
+				// 恢复 container 的网络相关属性
 				c.ResetRestartManager(false)
 				if !c.HostConfig.NetworkMode.IsContainer() && c.IsRunning() {
 					options, err := daemon.buildSandboxOptions(c)
@@ -318,6 +347,7 @@ func (daemon *Daemon) restore() error {
 				}
 			}
 
+			// 判断是否需要restart or remove
 			// get list of containers we need to restart
 
 			// Do not autostart containers which
@@ -336,6 +366,7 @@ func (daemon *Daemon) restore() error {
 				mapLock.Unlock()
 			}
 
+			// 处理特殊的容器状态: RemovalInProgress
 			c.Lock()
 			if c.RemovalInProgress {
 				// We probably crashed in the middle of a removal, reset
@@ -357,6 +388,8 @@ func (daemon *Daemon) restore() error {
 		}(c)
 	}
 	wg.Wait()
+
+	// 根据所有容器对应的网络初始化<netController>
 	daemon.netController, err = daemon.initNetworkController(daemon.configStore, activeSandboxes)
 	if err != nil {
 		return fmt.Errorf("Error initializing network controller: %v", err)
@@ -369,6 +402,7 @@ func (daemon *Daemon) restore() error {
 		}
 	}
 
+	// 重启需要重启的容器
 	group := sync.WaitGroup{}
 	for c, notifier := range restartContainers {
 		group.Add(1)
@@ -402,6 +436,7 @@ func (daemon *Daemon) restore() error {
 	}
 	group.Wait()
 
+	// 删除需要删除的容器
 	removeGroup := sync.WaitGroup{}
 	for id := range removeContainers {
 		removeGroup.Add(1)
@@ -892,9 +927,12 @@ func NewDaemon(config *config.Config, registryService registry.Service, containe
 		return nil, err
 	}
 
+	// 关键步骤: 容器的重新加载
 	if err := d.restore(); err != nil {
 		return nil, err
 	}
+
+	// 关闭<startupDone>, 表明daemon的准备流程已经完成
 	close(d.startupDone)
 
 	// FIXME: this method never returns an error
@@ -981,11 +1019,14 @@ func (daemon *Daemon) ShutdownTimeout() int {
 
 // Shutdown stops the daemon.
 func (daemon *Daemon) Shutdown() error {
+	// 置位 <shutdown>
 	daemon.shutdown = true
 	// Keep mounts and networking running on daemon shutdown if
 	// we are to keep containers running and restore them.
 
+	// 如果 "live_restore" 特性开启, 并且有容器存在, 那么直接返回, 不清理其他子模块
 	if daemon.configStore.LiveRestoreEnabled && daemon.containers != nil {
+		// 判断是否有容器, 如果没有容器还是要清理
 		// check if there are any running containers, if none we should do some cleanup
 		if ls, err := daemon.Containers(&types.ContainerListOptions{}); len(ls) != 0 || err != nil {
 			// metrics plugins still need some cleanup
@@ -994,18 +1035,23 @@ func (daemon *Daemon) Shutdown() error {
 		}
 	}
 
+	// 停止所有运行中的容器
 	if daemon.containers != nil {
 		logrus.Debugf("daemon configured with a %d seconds minimum shutdown timeout", daemon.configStore.ShutdownTimeout)
 		logrus.Debugf("start clean shutdown of all containers with a %d seconds timeout...", daemon.ShutdownTimeout())
+		// 对<containers>中所有容器执行以下函数
 		daemon.containers.ApplyAll(func(c *container.Container) {
+			// 只停止running 容器
 			if !c.IsRunning() {
 				return
 			}
+			// 停止容器
 			logrus.Debugf("stopping %s", c.ID)
 			if err := daemon.shutdownContainer(c); err != nil {
 				logrus.Errorf("Stop container error: %v", err)
 				return
 			}
+			// 取消容器的所有的挂载
 			if mountid, err := daemon.imageService.GetLayerMountID(c.ID, c.OS); err == nil {
 				daemon.cleanupMountsByID(mountid)
 			}
@@ -1013,32 +1059,38 @@ func (daemon *Daemon) Shutdown() error {
 		})
 	}
 
+	// shutdown volume
 	if daemon.volumes != nil {
 		if err := daemon.volumes.Shutdown(); err != nil {
 			logrus.Errorf("Error shutting down volume store: %v", err)
 		}
 	}
 
+	// 清理 imageService, 里面包括了 <imageStore> 与 <layerStore>
 	if daemon.imageService != nil {
 		daemon.imageService.Cleanup()
 	}
 
+	// 退出 cluster
 	// If we are part of a cluster, clean up cluster's stuff
 	if daemon.clusterProvider != nil {
 		logrus.Debugf("start clean shutdown of cluster resources...")
 		daemon.DaemonLeavesCluster()
 	}
 
+	// 清理 MetricsPlugins
 	daemon.cleanupMetricsPlugins()
 
 	// Shutdown plugins after containers and layerstore. Don't change the order.
 	daemon.pluginShutdown()
 
+	// 停止 libnetwork
 	// trigger libnetwork Stop only if it's initialized
 	if daemon.netController != nil {
 		daemon.netController.Stop()
 	}
 
+	// 清理 daemon相关的挂载
 	return daemon.cleanupMounts()
 }
 

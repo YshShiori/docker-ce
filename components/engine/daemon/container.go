@@ -90,8 +90,10 @@ func (daemon *Daemon) containerRoot(id string) string {
 // Load reads the contents of a container from disk
 // This is typically done at startup.
 func (daemon *Daemon) load(id string) (*container.Container, error) {
+	// 一个新的 container.Container 对象
 	container := daemon.newBaseContainer(id)
 
+	// 从container的持久化的配置文件恢复信息, 即 /var/lib/docker/containers/[id]/config.v2.json
 	if err := container.FromDisk(); err != nil {
 		return nil, err
 	}
@@ -99,6 +101,7 @@ func (daemon *Daemon) load(id string) (*container.Container, error) {
 		return nil, err
 	}
 
+	// 检查id是否对应
 	if container.ID != id {
 		return container, fmt.Errorf("Container %s is stored at %s", container.ID, id)
 	}
